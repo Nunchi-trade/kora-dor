@@ -117,6 +117,14 @@ impl DkgCeremony {
             self.send_outgoing(&network, &mut participant)?;
         } else {
             info!("Phase 1: Skipped (restored from state)");
+
+            // Issue #170: After crash recovery the dealer log was persisted but
+            // never re-broadcast.  Peers that missed the original broadcast
+            // will never receive it unless we re-queue it here.
+            if skip_phase3 {
+                participant.requeue_dealer_log_for_broadcast();
+                self.send_outgoing(&network, &mut participant)?;
+            }
         }
 
         // Phase 2: Collect dealer messages and send acks
@@ -407,29 +415,40 @@ impl DkgCeremony {
         Ok(())
     }
 
-    /// Send all outgoing messages.
+    /// Send all outgoing messages, re-queuing any that fail for retry on the
+    /// next cycle.  Without this, [`DkgParticipant::take_outgoing`] drains the
+    /// buffer and a transient network error permanently loses the message
+    /// (see issue #169).
     fn send_outgoing(
         &self,
         network: &DkgNetwork,
         participant: &mut DkgParticipant,
     ) -> Result<(), DkgError> {
+        let mut failed = Vec::new();
         for (target, msg) in participant.take_outgoing() {
             match target {
-                Some(pk) => {
-                    if let Err(e) = network.send_to(&pk, &msg) {
+                Some(ref pk) => {
+                    if let Err(e) = network.send_to(pk, &msg) {
                         warn!(
                             ?pk,
                             ?e,
                             "Failed to send DKG message to peer (will retry on next cycle)"
                         );
+                        failed.push((target, msg));
                     }
                 }
                 None => {
                     if let Err(e) = network.broadcast(&msg) {
                         warn!(?e, "Failed to broadcast DKG message (will retry on next cycle)");
+                        failed.push((target, msg));
                     }
                 }
             }
+        }
+        // Re-queue failed messages so they are retried on the next send cycle.
+        if !failed.is_empty() {
+            warn!(count = failed.len(), "Re-queuing failed outgoing DKG messages for retry");
+            participant.requeue_messages(failed);
         }
         Ok(())
     }

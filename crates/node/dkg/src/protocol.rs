@@ -268,6 +268,18 @@ impl ProtocolMessage {
             4 => ProtocolMessageKind::RequestLogs,
             5 => {
                 let count = u32::read(&mut reader)? as usize;
+
+                // Issue #167: Cap the entry count to prevent a malicious peer
+                // from triggering an OOM by sending a huge count.  The maximum
+                // number of dealer logs can never exceed `max_degree` (which
+                // is derived from `n`, the participant count).  We add a small
+                // margin (2x) to tolerate slight misconfigurations, but reject
+                // anything clearly unreasonable.
+                let max_entries = (max_degree as usize).saturating_mul(2);
+                if count > max_entries {
+                    return Err(commonware_codec::Error::InvalidLength(count));
+                }
+
                 let mut logs = Vec::with_capacity(count);
                 for _ in 0..count {
                     let pk = ed25519::PublicKey::read(&mut reader)?;
@@ -879,6 +891,37 @@ impl DkgParticipant {
     /// Take outgoing messages.
     pub fn take_outgoing(&mut self) -> Vec<(Option<ed25519::PublicKey>, ProtocolMessage)> {
         std::mem::take(&mut self.outgoing)
+    }
+
+    /// Re-queue messages that failed to send so they can be retried on the
+    /// next call to [`Self::take_outgoing`].  Messages are prepended so they
+    /// are attempted before any newly generated messages.
+    pub fn requeue_messages(
+        &mut self,
+        mut msgs: Vec<(Option<ed25519::PublicKey>, ProtocolMessage)>,
+    ) {
+        msgs.append(&mut self.outgoing);
+        self.outgoing = msgs;
+    }
+
+    /// Re-queue our signed dealer log for broadcast.
+    ///
+    /// This is used after crash recovery (issue #170): the dealer was finalized
+    /// and persisted before the crash, but peers may not have received the
+    /// broadcast.  Calling this method re-enqueues the log so it is sent on
+    /// the next [`Self::take_outgoing`] / `send_outgoing` cycle.
+    pub fn requeue_dealer_log_for_broadcast(&mut self) {
+        if let Some(ref log) = self.our_signed_log {
+            let ceremony_id = self.ceremony_id();
+            info!("Re-queuing dealer log for broadcast after crash recovery");
+            self.outgoing.push((
+                None, // broadcast
+                ProtocolMessage::new(
+                    ceremony_id,
+                    ProtocolMessageKind::DealerLog { log: log.clone() },
+                ),
+            ));
+        }
     }
 
     /// Get our signed dealer log (for sending to leader).

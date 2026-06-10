@@ -247,11 +247,13 @@ where
         // REVM's `DatabaseCommit::commit` returns `()`, so we cannot propagate
         // errors through the return type.  Instead we log at error level and
         // set an atomic flag that callers can check after execution.
+        let affected_addresses: Vec<_> = changeset.accounts.keys().take(5).copied().collect();
         if let Err(err) = block_on(Self::commit(self, changeset)) {
             error!(
                 %err,
+                ?affected_addresses,
                 "CRITICAL: DatabaseCommit failed — QMDB write error swallowed by infallible \
-                 REVM trait. Subsequent transactions in this block may execute against stale state."
+                 REVM trait. The executor will abort this block on the next commit-failure check."
             );
             self.mark_commit_failed();
         }

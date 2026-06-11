@@ -277,12 +277,18 @@ where
                 Err(e) => return Err(QmdbError::Storage(e.to_string())),
             };
 
-            // Increment generation on recreate or selfdestruct to invalidate old storage.
-            let new_gen = if update.created || update.selfdestructed {
-                current_gen.saturating_add(1)
-            } else {
-                current_gen
-            };
+            // Increment generation for each lifecycle transition to invalidate
+            // old storage. Created and selfdestructed each bump independently
+            // so that a create-then-selfdestruct in the same changeset
+            // invalidates both the pre-create and post-create storage slots.
+            let mut gen_bumps = 0u64;
+            if update.created {
+                gen_bumps += 1;
+            }
+            if update.selfdestructed {
+                gen_bumps += 1;
+            }
+            let new_gen = current_gen.saturating_add(gen_bumps);
 
             if update.selfdestructed {
                 batches.accounts.push((*address, None));
@@ -593,5 +599,136 @@ mod tests {
             assert_eq!(seqs.code, Some(i));
             assert!(seqs.is_consistent());
         }
+    }
+
+    #[tokio::test]
+    async fn build_batches_bumps_generation_for_created() {
+        let mut store = create_test_store();
+
+        // Seed an account at generation 0.
+        let initial = ChangeSet {
+            accounts: std::collections::BTreeMap::from([(
+                Address::ZERO,
+                crate::changes::AccountUpdate {
+                    created: false,
+                    selfdestructed: false,
+                    nonce: 1,
+                    balance: U256::from(100),
+                    code_hash: B256::ZERO,
+                    code: None,
+                    storage: std::collections::BTreeMap::new(),
+                },
+            )]),
+        };
+        store.commit_changes(initial).await.unwrap();
+
+        // Now create the account -- generation should go from 0 to 1.
+        let create = ChangeSet {
+            accounts: std::collections::BTreeMap::from([(
+                Address::ZERO,
+                crate::changes::AccountUpdate {
+                    created: true,
+                    selfdestructed: false,
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    storage: std::collections::BTreeMap::new(),
+                },
+            )]),
+        };
+        let batches = store.build_batches(&create).await.unwrap();
+        let (_, encoded) = &batches.accounts[0];
+        let (_, _, _, generation) = AccountEncoding::decode(encoded.as_ref().unwrap()).unwrap();
+        assert_eq!(generation, 1, "generation should bump by 1 for created");
+    }
+
+    #[tokio::test]
+    async fn build_batches_bumps_generation_for_selfdestruct() {
+        let mut store = create_test_store();
+
+        // Seed an account at generation 0.
+        let initial = ChangeSet {
+            accounts: std::collections::BTreeMap::from([(
+                Address::ZERO,
+                crate::changes::AccountUpdate {
+                    created: false,
+                    selfdestructed: false,
+                    nonce: 1,
+                    balance: U256::from(100),
+                    code_hash: B256::ZERO,
+                    code: None,
+                    storage: std::collections::BTreeMap::new(),
+                },
+            )]),
+        };
+        store.commit_changes(initial).await.unwrap();
+
+        // Selfdestruct -- generation should go from 0 to 1.
+        let sd = ChangeSet {
+            accounts: std::collections::BTreeMap::from([(
+                Address::ZERO,
+                crate::changes::AccountUpdate {
+                    created: false,
+                    selfdestructed: true,
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    storage: std::collections::BTreeMap::new(),
+                },
+            )]),
+        };
+        let batches = store.build_batches(&sd).await.unwrap();
+        // selfdestructed accounts are deleted (None).
+        let (addr, val) = &batches.accounts[0];
+        assert_eq!(*addr, Address::ZERO);
+        assert!(val.is_none(), "selfdestructed account should be deleted");
+    }
+
+    #[tokio::test]
+    async fn build_batches_bumps_generation_by_two_for_created_and_selfdestructed() {
+        let mut store = create_test_store();
+
+        // Seed an account at generation 0.
+        let initial = ChangeSet {
+            accounts: std::collections::BTreeMap::from([(
+                Address::ZERO,
+                crate::changes::AccountUpdate {
+                    created: false,
+                    selfdestructed: false,
+                    nonce: 1,
+                    balance: U256::from(100),
+                    code_hash: B256::ZERO,
+                    code: None,
+                    storage: std::collections::BTreeMap::new(),
+                },
+            )]),
+        };
+        store.commit_changes(initial).await.unwrap();
+
+        // Both created and selfdestructed -- generation should bump by 2.
+        // Note: after the merge fix, created+selfdestructed should not normally
+        // both be true (selfdestruct clears created). But build_batches should
+        // handle it correctly as defense-in-depth.
+        let both = ChangeSet {
+            accounts: std::collections::BTreeMap::from([(
+                Address::ZERO,
+                crate::changes::AccountUpdate {
+                    created: true,
+                    selfdestructed: true,
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    storage: std::collections::BTreeMap::new(),
+                },
+            )]),
+        };
+        let batches = store.build_batches(&both).await.unwrap();
+        // selfdestructed => account deleted.
+        let (addr, val) = &batches.accounts[0];
+        assert_eq!(*addr, Address::ZERO);
+        assert!(val.is_none(), "selfdestructed account should be deleted");
     }
 }

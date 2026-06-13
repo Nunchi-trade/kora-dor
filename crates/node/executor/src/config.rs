@@ -37,6 +37,17 @@ pub struct BaseFeeParams {
 impl BaseFeeParams {
     /// Default base fee parameters.
     pub const DEFAULT: Self = Self { elasticity_multiplier: 2, max_change_denominator: 8 };
+
+    /// Create validated base fee parameters.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either `elasticity_multiplier` or `max_change_denominator` is zero.
+    pub fn new(elasticity_multiplier: u64, max_change_denominator: u64) -> Self {
+        assert!(elasticity_multiplier > 0, "elasticity_multiplier must be > 0");
+        assert!(max_change_denominator > 0, "max_change_denominator must be > 0");
+        Self { elasticity_multiplier, max_change_denominator }
+    }
 }
 
 impl Default for BaseFeeParams {

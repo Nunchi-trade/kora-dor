@@ -329,13 +329,29 @@ fn call_params_to_tx_env(
 }
 
 /// Calculate the expected base fee for the next block (EIP-1559).
+///
+/// Returns `parent_base_fee` unchanged if any divisor would be zero, which can
+/// happen when `elasticity_multiplier` is 0, `max_change_denominator` is 0, or
+/// the computed `parent_gas_target` is 0 (e.g. `parent_gas_limit` is 0 or
+/// smaller than `elasticity_multiplier`).
 pub fn calculate_base_fee(
     parent_base_fee: u64,
     parent_gas_used: u64,
     parent_gas_limit: u64,
     params: &crate::BaseFeeParams,
 ) -> u64 {
+    // Guard: prevent division by zero from misconfigured params (issues #089, #124).
+    if params.elasticity_multiplier == 0 || params.max_change_denominator == 0 {
+        return parent_base_fee;
+    }
+
     let parent_gas_target = parent_gas_limit / params.elasticity_multiplier;
+
+    // Guard: parent_gas_target can be zero when parent_gas_limit < elasticity_multiplier
+    // or parent_gas_limit is zero (issue #124).
+    if parent_gas_target == 0 {
+        return parent_base_fee;
+    }
 
     if parent_gas_used == parent_gas_target {
         return parent_base_fee;
@@ -974,6 +990,64 @@ mod tests {
         let params = crate::BaseFeeParams::default();
         let base_fee = calculate_base_fee(1000, 10_000_000, 30_000_000, &params);
         assert!(base_fee < 1000);
+    }
+
+    #[test]
+    fn calculate_base_fee_zero_elasticity_returns_parent() {
+        let params = crate::BaseFeeParams { elasticity_multiplier: 0, max_change_denominator: 8 };
+        // Must not panic; returns parent_base_fee unchanged.
+        let base_fee = calculate_base_fee(1000, 15_000_000, 30_000_000, &params);
+        assert_eq!(base_fee, 1000);
+    }
+
+    #[test]
+    fn calculate_base_fee_zero_denominator_returns_parent() {
+        let params = crate::BaseFeeParams { elasticity_multiplier: 2, max_change_denominator: 0 };
+        // Must not panic; returns parent_base_fee unchanged.
+        let base_fee = calculate_base_fee(1000, 20_000_000, 30_000_000, &params);
+        assert_eq!(base_fee, 1000);
+    }
+
+    #[test]
+    fn calculate_base_fee_both_params_zero_returns_parent() {
+        let params = crate::BaseFeeParams { elasticity_multiplier: 0, max_change_denominator: 0 };
+        let base_fee = calculate_base_fee(1000, 20_000_000, 30_000_000, &params);
+        assert_eq!(base_fee, 1000);
+    }
+
+    #[test]
+    fn calculate_base_fee_zero_gas_limit_returns_parent() {
+        let params = crate::BaseFeeParams::default();
+        // parent_gas_limit = 0 => parent_gas_target = 0 => must not panic.
+        let base_fee = calculate_base_fee(1000, 0, 0, &params);
+        assert_eq!(base_fee, 1000);
+    }
+
+    #[test]
+    fn calculate_base_fee_gas_limit_less_than_elasticity_returns_parent() {
+        let params = crate::BaseFeeParams::default(); // elasticity = 2
+        // parent_gas_limit = 1 < 2 => parent_gas_target = 0 => must not panic.
+        let base_fee = calculate_base_fee(1000, 1, 1, &params);
+        assert_eq!(base_fee, 1000);
+    }
+
+    #[test]
+    fn base_fee_params_new_valid() {
+        let params = crate::BaseFeeParams::new(4, 16);
+        assert_eq!(params.elasticity_multiplier, 4);
+        assert_eq!(params.max_change_denominator, 16);
+    }
+
+    #[test]
+    #[should_panic(expected = "elasticity_multiplier must be > 0")]
+    fn base_fee_params_new_zero_elasticity_panics() {
+        let _ = crate::BaseFeeParams::new(0, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_change_denominator must be > 0")]
+    fn base_fee_params_new_zero_denominator_panics() {
+        let _ = crate::BaseFeeParams::new(2, 0);
     }
 
     #[test]

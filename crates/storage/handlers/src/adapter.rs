@@ -1,8 +1,9 @@
 //! REVM database trait implementations.
 //!
-//! Note: REVM's `DatabaseRef` trait is synchronous, so we use `futures::executor::block_on`
-//! to bridge the async QMDB traits into the sync REVM interface. This is acceptable for
-//! in-memory stores but may block the async runtime for I/O-bound stores.
+//! Note: REVM's `DatabaseRef` trait is synchronous, so we bridge async QMDB operations
+//! into the sync REVM interface. When a Tokio multi-thread runtime is available, we use
+//! `block_in_place` + `Handle::block_on` to avoid deadlocks. Otherwise we fall back to
+//! `futures::executor::block_on` for non-Tokio contexts (e.g. unit tests).
 
 use std::sync::Arc;
 
@@ -75,8 +76,21 @@ where
 
 /// Wrapper for blocking async operations in sync contexts.
 ///
-/// This is used to bridge async QMDB operations into REVM's sync DatabaseRef trait.
+/// When a Tokio multi-thread runtime is available (the normal production case),
+/// `block_in_place` + `handle.block_on` is used to safely drive the future
+/// without creating a nested executor or starving async workers.
+///
+/// When no Tokio runtime is present (e.g. synchronous unit tests), we fall back
+/// to `futures::executor::block_on`.
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    use tokio::runtime::RuntimeFlavor;
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == RuntimeFlavor::MultiThread
+    {
+        return tokio::task::block_in_place(|| handle.block_on(f));
+    }
+
     futures::executor::block_on(f)
 }
 

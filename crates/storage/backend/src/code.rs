@@ -82,19 +82,22 @@ impl QmdbBatchable for CodeStore {
         I: IntoIterator<Item = (Self::Key, Option<Self::Value>)> + Send,
         I::IntoIter: Send,
     {
-        let inner = self.inner.take()?;
-        let mut batch = inner.new_batch();
+        let mut guard = self.inner.guard()?;
+        let mut batch = guard.as_ref().new_batch();
         for (hash, value) in ops {
             batch = batch.write(code_key(hash), value);
         }
         let merkleized = batch
-            .merkleize(&inner, None)
+            .merkleize(guard.as_ref(), None)
             .await
             .map_err(|e| BackendError::Storage(e.to_string()))?;
-        let mut inner = inner;
-        inner.apply_batch(merkleized).await.map_err(|e| BackendError::Storage(e.to_string()))?;
-        inner.commit().await.map_err(|e| BackendError::Storage(e.to_string()))?;
-        self.inner.restore(inner);
+        guard
+            .as_mut()
+            .apply_batch(merkleized)
+            .await
+            .map_err(|e| BackendError::Storage(e.to_string()))?;
+        guard.as_ref().commit().await.map_err(|e| BackendError::Storage(e.to_string()))?;
+        guard.as_ref().sync().await.map_err(|e| BackendError::Storage(e.to_string()))?;
         Ok(())
     }
 }

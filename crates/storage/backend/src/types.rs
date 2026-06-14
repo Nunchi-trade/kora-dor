@@ -114,16 +114,46 @@ impl<T> StoreSlot<T> {
         self.0.as_ref().ok_or(BackendError::NotInitialized)
     }
 
-    pub(crate) fn take(&mut self) -> Result<T, BackendError> {
-        self.0.take().ok_or(BackendError::NotInitialized)
-    }
-
-    pub(crate) fn restore(&mut self, inner: T) {
-        self.0 = Some(inner);
+    /// Temporarily take ownership via an RAII guard.
+    ///
+    /// The guard restores the inner value on drop (including on panic/unwind),
+    /// preventing the slot from being left permanently empty.
+    pub(crate) fn guard(&mut self) -> Result<StoreGuard<'_, T>, BackendError> {
+        let inner = self.0.take().ok_or(BackendError::NotInitialized)?;
+        Ok(StoreGuard { slot: self, inner: Some(inner) })
     }
 
     pub(crate) fn into_inner(self) -> Result<T, BackendError> {
         self.0.ok_or(BackendError::NotInitialized)
+    }
+}
+
+/// RAII guard that restores the inner value to a [`StoreSlot`] on drop.
+///
+/// This prevents the slot from being left in a permanent `None` state if a
+/// panic occurs between take and restore during batch writes.
+pub(crate) struct StoreGuard<'a, T> {
+    slot: &'a mut StoreSlot<T>,
+    inner: Option<T>,
+}
+
+impl<T> StoreGuard<'_, T> {
+    #[allow(clippy::missing_const_for_fn)] // expect() is not const-stable
+    pub(crate) fn as_ref(&self) -> &T {
+        self.inner.as_ref().expect("StoreGuard inner is always Some while guard is live")
+    }
+
+    #[allow(clippy::missing_const_for_fn)] // expect() is not const-stable
+    pub(crate) fn as_mut(&mut self) -> &mut T {
+        self.inner.as_mut().expect("StoreGuard inner is always Some while guard is live")
+    }
+}
+
+impl<T> Drop for StoreGuard<'_, T> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            self.slot.0 = Some(inner);
+        }
     }
 }
 
@@ -180,25 +210,31 @@ mod tests {
     }
 
     #[test]
-    fn test_store_slot_take_removes_value() {
+    fn test_store_slot_guard_borrows_value() {
         let mut slot = StoreSlot::new(42);
-        assert_eq!(slot.take().unwrap(), 42);
-        assert!(slot.get().is_err());
+        {
+            let guard = slot.guard().unwrap();
+            assert_eq!(*guard.as_ref(), 42);
+        }
+        // Value is restored after guard is dropped.
+        assert_eq!(*slot.get().unwrap(), 42);
     }
 
     #[test]
-    fn test_store_slot_take_twice_fails() {
+    fn test_store_slot_guard_restores_on_drop() {
         let mut slot = StoreSlot::new(42);
-        slot.take().unwrap();
-        assert!(slot.take().is_err());
-    }
-
-    #[test]
-    fn test_store_slot_restore_after_take() {
-        let mut slot = StoreSlot::new(42);
-        slot.take().unwrap();
-        slot.restore(100);
+        {
+            let mut guard = slot.guard().unwrap();
+            *guard.as_mut() = 100;
+        }
         assert_eq!(*slot.get().unwrap(), 100);
+    }
+
+    #[test]
+    fn test_store_slot_guard_twice_fails() {
+        let mut slot = StoreSlot::new(42);
+        let _guard = slot.guard().unwrap();
+        // Cannot call guard again while the first guard is live (borrow checker prevents this).
     }
 
     #[test]
@@ -208,9 +244,12 @@ mod tests {
     }
 
     #[test]
-    fn test_store_slot_into_inner_after_take_fails() {
+    fn test_store_slot_into_inner_after_guard_succeeds() {
         let mut slot = StoreSlot::new(42);
-        slot.take().unwrap();
-        assert!(slot.into_inner().is_err());
+        {
+            let _guard = slot.guard().unwrap();
+            // Guard restores value on drop
+        }
+        assert_eq!(slot.into_inner().unwrap(), 42);
     }
 }

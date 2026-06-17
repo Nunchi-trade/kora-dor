@@ -1,21 +1,96 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 use kora_qmdb::ChangeSet;
 use kora_traits::{StateDb, StateDbError, StateDbRead, StateDbWrite};
 
 /// State overlay that layers pending changes on top of a base state database.
+///
+/// Bytecode is deduplicated in an internal `code_by_hash` index keyed by code
+/// hash.  This gives O(1) code lookups (instead of the previous O(N) linear
+/// scan) and ensures that identical bytecodes deployed by different accounts
+/// are stored only once.
+///
+/// The overlay changeset is stored with code bytes stripped out of individual
+/// [`AccountUpdate`]s -- the authoritative copy lives in the code index.
+/// This makes cloning the changeset (needed during `commit` / `compute_root`)
+/// significantly cheaper because bytecode (often many KB) is no longer
+/// deep-copied per account.
 #[derive(Clone, Debug)]
 pub struct OverlayState<S> {
     base: S,
+    /// Account-level changes **without** inline code bytes.  Code is stored
+    /// separately in `code_by_hash`.
     changes: Arc<ChangeSet>,
+    /// Deduplicated code index: code_hash -> bytecode.
+    ///
+    /// `Bytes` is internally reference-counted, so cloning this map is cheap.
+    code_by_hash: Arc<HashMap<B256, Bytes>>,
+}
+
+/// Build the deduplicated code index from a [`ChangeSet`], stripping the
+/// `code` field from each [`AccountUpdate`] in the process.
+fn build_code_index(changes: &mut ChangeSet) -> HashMap<B256, Bytes> {
+    let mut index = HashMap::new();
+    for update in changes.accounts.values_mut() {
+        if let Some(code) = update.code.take() {
+            // Only insert if we haven't seen this code hash yet -- this is
+            // where deduplication happens (issue #144).
+            index.entry(update.code_hash).or_insert_with(|| Bytes::from(code));
+        }
+    }
+    index
+}
+
+/// Re-attach code bytes from the code index into the changeset's account
+/// updates so downstream consumers (e.g. the base `StateDbWrite`) see the
+/// full data.
+fn reattach_code(changes: &mut ChangeSet, code_index: &HashMap<B256, Bytes>) {
+    for update in changes.accounts.values_mut() {
+        if update.code.is_none()
+            && let Some(bytes) = code_index.get(&update.code_hash)
+        {
+            update.code = Some(bytes.to_vec());
+        }
+    }
+}
+
+/// Merge the overlay changeset with incoming changes, building a combined
+/// code index along the way.
+fn merge_and_reattach(
+    overlay: &ChangeSet,
+    overlay_code: &HashMap<B256, Bytes>,
+    mut incoming: ChangeSet,
+) -> ChangeSet {
+    // Collect code from the incoming changeset into a temporary index.
+    let incoming_code = build_code_index(&mut incoming);
+
+    // Clone the overlay changeset -- this is cheap now since code bytes have
+    // been stripped out.
+    let mut merged = overlay.clone();
+    merged.merge(incoming);
+
+    // Build a combined code index (overlay code + incoming code).
+    let mut combined_code = overlay_code.clone();
+    for (hash, bytes) in &incoming_code {
+        combined_code.entry(*hash).or_insert_with(|| bytes.clone());
+    }
+
+    // Reattach code into the merged changeset for the downstream base layer.
+    reattach_code(&mut merged, &combined_code);
+    merged
 }
 
 impl<S> OverlayState<S> {
     /// Create a new overlay from a base state and a change set.
+    ///
+    /// Bytecodes are extracted from the changeset into a deduplicated index
+    /// keyed by code hash, and the `code` field on individual account updates
+    /// is cleared.
     #[must_use]
-    pub fn new(base: S, changes: ChangeSet) -> Self {
-        Self { base, changes: Arc::new(changes) }
+    pub fn new(base: S, mut changes: ChangeSet) -> Self {
+        let code_by_hash = build_code_index(&mut changes);
+        Self { base, changes: Arc::new(changes), code_by_hash: Arc::new(code_by_hash) }
     }
 
     /// Return the number of accounts in the overlay change set.
@@ -31,10 +106,14 @@ impl<S> OverlayState<S> {
     }
 
     /// Merge the current overlay changes with a newer change set.
+    ///
+    /// The returned changeset has code bytes attached to every account that
+    /// deployed code.
     pub fn merge_changes(&self, newer: ChangeSet) -> ChangeSet {
-        let mut merged = (*self.changes).clone();
-        merged.merge(newer);
-        merged
+        if self.changes.is_empty() {
+            return newer;
+        }
+        merge_and_reattach(&self.changes, &self.code_by_hash, newer)
     }
 }
 
@@ -91,20 +170,20 @@ impl<S: StateDbRead> StateDbRead for OverlayState<S> {
         }
     }
 
+    /// O(1) code lookup via the deduplicated `code_by_hash` index.
+    ///
+    /// Previously this was an O(N) linear scan over every changed account.
     fn code(
         &self,
         code_hash: &B256,
     ) -> impl std::future::Future<Output = Result<Bytes, StateDbError>> + Send {
         let code_hash = *code_hash;
         let base = self.base.clone();
-        let changes = Arc::clone(&self.changes);
+        let code_index = Arc::clone(&self.code_by_hash);
         async move {
-            for update in changes.accounts.values() {
-                if update.code_hash == code_hash
-                    && let Some(code) = &update.code
-                {
-                    return Ok(Bytes::from(code.clone()));
-                }
+            // O(1) HashMap lookup instead of O(N) linear scan.
+            if let Some(code) = code_index.get(&code_hash) {
+                return Ok(code.clone()); // Bytes::clone is Arc-increment, not a copy.
             }
             base.code(&code_hash).await
         }
@@ -143,9 +222,20 @@ impl<S: StateDbWrite> StateDbWrite for OverlayState<S> {
     ) -> impl std::future::Future<Output = Result<B256, StateDbError>> + Send {
         let base = self.base.clone();
         let overlay = Arc::clone(&self.changes);
+        let overlay_code = Arc::clone(&self.code_by_hash);
         async move {
-            let mut merged = (*overlay).clone();
-            merged.merge(changes);
+            // Fast path: if overlay is empty, skip cloning entirely.
+            if overlay.is_empty() {
+                return base.commit(changes).await;
+            }
+            // Fast path: if incoming changes are empty, reattach code and
+            // commit the overlay as-is.
+            if changes.is_empty() {
+                let mut overlay_owned = (*overlay).clone();
+                reattach_code(&mut overlay_owned, &overlay_code);
+                return base.commit(overlay_owned).await;
+            }
+            let merged = merge_and_reattach(&overlay, &overlay_code, changes);
             base.commit(merged).await
         }
     }
@@ -156,10 +246,21 @@ impl<S: StateDbWrite> StateDbWrite for OverlayState<S> {
     ) -> impl std::future::Future<Output = Result<B256, StateDbError>> + Send {
         let base = self.base.clone();
         let overlay = Arc::clone(&self.changes);
+        let overlay_code = Arc::clone(&self.code_by_hash);
         let changes = changes.clone();
         async move {
-            let mut merged = (*overlay).clone();
-            merged.merge(changes);
+            // Fast path: if overlay is empty, pass incoming changes directly.
+            if overlay.is_empty() {
+                return base.compute_root(&changes).await;
+            }
+            // Fast path: if incoming changes are empty, reattach code to
+            // overlay and compute root without merging.
+            if changes.is_empty() {
+                let mut overlay_owned = (*overlay).clone();
+                reattach_code(&mut overlay_owned, &overlay_code);
+                return base.compute_root(&overlay_owned).await;
+            }
+            let merged = merge_and_reattach(&overlay, &overlay_code, changes);
             base.compute_root(&merged).await
         }
     }
@@ -536,5 +637,126 @@ mod tests {
         let unknown_hash = B256::repeat_byte(0xFF);
 
         assert_eq!(overlay.code(&unknown_hash).await.unwrap(), Bytes::new());
+    }
+
+    // --- New tests for the three performance fixes ---
+
+    #[tokio::test]
+    async fn test_code_deduplication_across_accounts() {
+        // Two accounts deploying identical bytecode should result in a single
+        // entry in the code index (issue #144).
+        let addr1 = Address::repeat_byte(0x10);
+        let addr2 = Address::repeat_byte(0x11);
+        let code_hash = B256::repeat_byte(0xDE);
+        let code_bytes = vec![0x60, 0x00, 0x60, 0x00, 0xFD];
+
+        let base = MockStateDb::new();
+        let mut changes = ChangeSet::new();
+        changes.accounts.insert(
+            addr1,
+            AccountUpdate {
+                created: true,
+                selfdestructed: false,
+                nonce: 1,
+                balance: U256::ZERO,
+                code_hash,
+                code: Some(code_bytes.clone()),
+                storage: BTreeMap::new(),
+            },
+        );
+        changes.accounts.insert(
+            addr2,
+            AccountUpdate {
+                created: true,
+                selfdestructed: false,
+                nonce: 1,
+                balance: U256::ZERO,
+                code_hash,
+                code: Some(code_bytes.clone()),
+                storage: BTreeMap::new(),
+            },
+        );
+
+        let overlay = OverlayState::new(base, changes);
+
+        // Code index should have exactly one entry for this hash.
+        assert_eq!(overlay.code_by_hash.len(), 1);
+
+        // Both accounts should resolve to the same bytecode via the index.
+        assert_eq!(overlay.code(&code_hash).await.unwrap(), Bytes::from(code_bytes));
+    }
+
+    #[test]
+    fn test_code_stripped_from_changeset_accounts() {
+        // After construction, account updates in the changeset should have
+        // their code field set to None (moved into the code index).
+        let addr = Address::repeat_byte(0x20);
+        let code_hash = B256::repeat_byte(0xAA);
+
+        let mut changes = ChangeSet::new();
+        changes.accounts.insert(
+            addr,
+            AccountUpdate {
+                created: true,
+                selfdestructed: false,
+                nonce: 1,
+                balance: U256::ZERO,
+                code_hash,
+                code: Some(vec![0x60, 0x00]),
+                storage: BTreeMap::new(),
+            },
+        );
+
+        let overlay = OverlayState::new(MockStateDb::new(), changes);
+
+        // Code should be stripped from the account update.
+        assert!(overlay.changes.accounts.get(&addr).unwrap().code.is_none());
+        // But present in the code index.
+        assert!(overlay.code_by_hash.contains_key(&code_hash));
+    }
+
+    #[test]
+    fn test_merge_changes_reattaches_code() {
+        // merge_changes should produce a ChangeSet with code bytes reattached
+        // from the code index.
+        let addr = Address::repeat_byte(0x30);
+        let code_hash = B256::repeat_byte(0xBB);
+        let code_bytes = vec![0x60, 0x01];
+
+        let mut changes = ChangeSet::new();
+        changes.accounts.insert(
+            addr,
+            AccountUpdate {
+                created: true,
+                selfdestructed: false,
+                nonce: 1,
+                balance: U256::ZERO,
+                code_hash,
+                code: Some(code_bytes.clone()),
+                storage: BTreeMap::new(),
+            },
+        );
+
+        let overlay = OverlayState::new(MockStateDb::new(), changes);
+        let merged = overlay.merge_changes(ChangeSet::new());
+
+        // The merged changeset should have code bytes reattached.
+        let update = merged.accounts.get(&addr).unwrap();
+        assert_eq!(update.code.as_deref(), Some(code_bytes.as_slice()));
+    }
+
+    #[test]
+    fn test_merge_changes_empty_overlay_returns_newer() {
+        // When the overlay is empty, merge_changes should return the newer
+        // changeset directly without cloning (fast path for issue #039).
+        let addr = Address::repeat_byte(0x40);
+        let mut newer = ChangeSet::new();
+        newer.accounts.insert(addr, test_account(5, 500));
+
+        let overlay = OverlayState::new(MockStateDb::new(), ChangeSet::new());
+        let merged = overlay.merge_changes(newer);
+
+        assert!(merged.accounts.contains_key(&addr));
+        assert_eq!(merged.accounts.get(&addr).unwrap().nonce, 5);
     }
 }

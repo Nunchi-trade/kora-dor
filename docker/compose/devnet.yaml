@@ -40,7 +40,7 @@ x-validator-common: &validator-common
   <<: *node-common
   restart: unless-stopped
   init: true
-  stop_grace_period: 5s
+  stop_grace_period: 30s
   stop_signal: SIGTERM
   read_only: true
   security_opt:
@@ -153,6 +153,7 @@ services:
       - VALIDATOR_INDEX=0
       - IS_BOOTSTRAP=true
       - IS_LEADER=true
+      - KORA_DIALABLE_ADDR=node0:30303
     ports:
       - "${P2P_PUBLISH_HOST:-0.0.0.0}:30300:30303"
 
@@ -175,6 +176,7 @@ services:
       - VALIDATOR_INDEX=1
       - IS_BOOTSTRAP=false
       - BOOTSTRAP_PEERS=node0:30303
+      - KORA_DIALABLE_ADDR=node1:30303
     ports:
       - "${P2P_PUBLISH_HOST:-0.0.0.0}:30301:30303"
 
@@ -197,6 +199,7 @@ services:
       - VALIDATOR_INDEX=2
       - IS_BOOTSTRAP=false
       - BOOTSTRAP_PEERS=node0:30303
+      - KORA_DIALABLE_ADDR=node2:30303
     ports:
       - "${P2P_PUBLISH_HOST:-0.0.0.0}:30302:30303"
 
@@ -219,6 +222,7 @@ services:
       - VALIDATOR_INDEX=3
       - IS_BOOTSTRAP=false
       - BOOTSTRAP_PEERS=node0:30303
+      - KORA_DIALABLE_ADDR=node3:30303
     ports:
       - "${P2P_PUBLISH_HOST:-0.0.0.0}:30303:30303"
 
@@ -244,6 +248,7 @@ services:
       - VALIDATOR_COUNT=4
       - IS_BOOTSTRAP=true
       - PEER_NODES=node0,node1,node2,node3
+      - KORA_DIALABLE_ADDR=node0:30303
       - HEALTHCHECK_MODE=ready
     ports:
       - "${P2P_PUBLISH_HOST:-0.0.0.0}:30400:30303"
@@ -272,6 +277,7 @@ services:
       - VALIDATOR_COUNT=4
       - IS_BOOTSTRAP=true
       - PEER_NODES=node0,node1,node2,node3
+      - KORA_DIALABLE_ADDR=node1:30303
       - HEALTHCHECK_MODE=ready
     ports:
       - "${P2P_PUBLISH_HOST:-0.0.0.0}:30401:30303"
@@ -301,6 +307,7 @@ services:
       - IS_BOOTSTRAP=false
       - BOOTSTRAP_PEERS=node0:30303,node1:30303
       - PEER_NODES=node0,node1,node2,node3
+      - KORA_DIALABLE_ADDR=node2:30303
       - HEALTHCHECK_MODE=ready
     ports:
       - "${P2P_PUBLISH_HOST:-0.0.0.0}:30402:30303"
@@ -330,6 +337,7 @@ services:
       - IS_BOOTSTRAP=false
       - BOOTSTRAP_PEERS=node0:30303,node1:30303
       - PEER_NODES=node0,node1,node2,node3
+      - KORA_DIALABLE_ADDR=node3:30303
       - HEALTHCHECK_MODE=ready
     ports:
       - "${P2P_PUBLISH_HOST:-0.0.0.0}:30403:30303"
@@ -354,6 +362,7 @@ services:
       - KORA_CHECKPOINT_INTERVAL=${KORA_CHECKPOINT_INTERVAL:-256}
       - IS_BOOTSTRAP=false
       - BOOTSTRAP_PEERS=node0:30303,node1:30303
+      - KORA_DIALABLE_ADDR=secondary0:30303
       - HEALTHCHECK_MODE=p2p
     ports:
       - "${P2P_PUBLISH_HOST:-0.0.0.0}:30500:30303"

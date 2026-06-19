@@ -24,6 +24,10 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ───────────────────────────────────────────────────────────────────────────
 FROM chef AS builder
 
+# BUILD_PROFILE controls the cargo profile (release, dev, etc.).
+# Passed from docker-bake.hcl; defaults to "release" for production builds.
+ARG BUILD_PROFILE=release
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
@@ -32,13 +36,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy recipe and build dependencies (this layer is cached)
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --profile ${BUILD_PROFILE} --recipe-path recipe.json
 
 # Copy source and build application
 COPY . .
 
-# Build all binaries
-RUN cargo build --release -p kora -p keygen -p loadgen
+# Build only the binaries needed in the production image (kora + keygen).
+# loadgen is intentionally excluded to reduce attack surface (see #190).
+RUN cargo build --profile ${BUILD_PROFILE} -p kora -p keygen \
+    && PROFILE_DIR=$(if [ "${BUILD_PROFILE}" = "dev" ]; then echo "debug"; else echo "${BUILD_PROFILE}"; fi) \
+    && mkdir -p /app/out \
+    && cp /app/target/${PROFILE_DIR}/kora /app/out/ \
+    && cp /app/target/${PROFILE_DIR}/keygen /app/out/
 
 # ───────────────────────────────────────────────────────────────────────────
 # Stage 4: Runtime - Minimal production image
@@ -59,10 +68,11 @@ RUN useradd -m -u 1000 -s /bin/bash kora && \
     mkdir -p /var/lib/kora /etc/kora /data /shared /runtime && \
     chown -R kora:kora /var/lib/kora /etc/kora /data /shared /runtime
 
-# Copy binaries from builder
-COPY --from=builder /app/target/release/kora /usr/local/bin/
-COPY --from=builder /app/target/release/keygen /usr/local/bin/
-COPY --from=builder /app/target/release/loadgen /usr/local/bin/
+# Copy binaries from builder.
+# loadgen is intentionally excluded from the production image to reduce
+# attack surface (#190). Build it separately if needed for testing.
+COPY --from=builder /app/out/kora /usr/local/bin/
+COPY --from=builder /app/out/keygen /usr/local/bin/
 
 # Copy entrypoint scripts
 COPY docker/scripts/ /scripts/

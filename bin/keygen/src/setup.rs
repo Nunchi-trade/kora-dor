@@ -194,6 +194,14 @@ pub(crate) fn run(args: SetupArgs) -> Result<()> {
         funded_allocation("0xDdE169289B51C512268D0b11EE2b15160b1e1793"),
         funded_allocation("0xde738C4084dDE5083A7959235Fd230e27eAFC63B"),
     ];
+    tracing::warn!(
+        loadgen_accounts = LOADGEN_ACCOUNT_COUNT,
+        "Genesis includes {} accounts with INSECURE deterministic keys \
+         (private key = 0x01..0x{:02x}). These keys are publicly known. \
+         DO NOT use this genesis on a network with real economic value.",
+        LOADGEN_ACCOUNT_COUNT,
+        LOADGEN_ACCOUNT_COUNT
+    );
     allocations.extend(funded_loadgen_allocations());
 
     let genesis = GenesisConfig { chain_id: args.chain_id, timestamp: 0, allocations };

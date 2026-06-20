@@ -416,6 +416,18 @@ async fn restore_checkpoint_and_replay_tail(
                     break;
                 }
                 replay_finalized_block(ledger, provider, &executor, block, block_index).await?;
+                // Write the commit marker synchronously after each successful
+                // replay so that a crash does not leave the marker pointing to
+                // a stale block.
+                if let Err(e) =
+                    crate::commit_marker::write_commit_marker(data_dir, &block.commitment())
+                {
+                    warn!(
+                        error = %e,
+                        height = block.height,
+                        "failed to write commit marker during replay"
+                    );
+                }
                 restored_height = block.height;
                 restored_digest = block.commitment();
                 replayed_tail = true;

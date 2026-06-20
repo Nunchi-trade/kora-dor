@@ -182,6 +182,18 @@ impl Cli {
                 "Loaded bootstrap peers from peers.json"
             );
 
+            // Cross-validate: DKG participant count must match peers.json
+            let dkg_n = dkg_output.participants;
+            let peers_n = peers.participants.len();
+            if dkg_n != peers_n {
+                return Err(eyre::eyre!(
+                    "DKG output has {} participants but peers.json has {} participants. \
+                     Ensure both files are from the same DKG ceremony.",
+                    dkg_n,
+                    peers_n
+                ));
+            }
+
             secondary_participants = peers.secondary_participants;
         }
 

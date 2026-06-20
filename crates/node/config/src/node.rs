@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::{ConfigError, ConsensusConfig, ExecutionConfig, NetworkConfig, RpcConfig};
 
 /// Default chain ID for local development.
-pub const DEFAULT_CHAIN_ID: u64 = 1;
+///
+/// Uses 1337 (standard devnet chain ID) to avoid colliding with
+/// Ethereum mainnet (chain_id=1) and the associated EIP-155 replay risk.
+pub const DEFAULT_CHAIN_ID: u64 = 1337;
 
 /// Default data directory.
 pub const DEFAULT_DATA_DIR: &str = "/var/lib/kora";
@@ -68,11 +71,34 @@ impl Default for NodeConfig {
 impl NodeConfig {
     /// Validate configuration values.
     ///
-    /// Returns an error if any value is out of range.
+    /// Returns an error if any value is out of range or consensus parameters
+    /// are internally inconsistent.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.worker_threads == 0 {
             return Err(ConfigError::InvalidValue("worker_threads must be >= 1".to_string()));
         }
+
+        // Validate chain_id is not zero (invalid per EIP-155).
+        if self.chain_id == 0 {
+            return Err(ConfigError::InvalidValue("chain_id must not be 0".to_string()));
+        }
+
+        // Cross-check consensus parameters when participants are configured.
+        if !self.consensus.participants.is_empty() {
+            if self.consensus.threshold == 0 {
+                return Err(ConfigError::InvalidValue(
+                    "consensus.threshold must be >= 1 when participants are configured".to_string(),
+                ));
+            }
+            if self.consensus.threshold > self.consensus.participants.len() as u32 {
+                return Err(ConfigError::InvalidValue(format!(
+                    "consensus.threshold ({}) exceeds participant count ({})",
+                    self.consensus.threshold,
+                    self.consensus.participants.len()
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -150,7 +176,13 @@ impl NodeConfig {
                 Ok(private_key_from_seed(seed))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Generate new key
+                // Generate new key -- warn prominently so operators notice in production
+                tracing::warn!(
+                    path = %key_path.display(),
+                    "Validator key not found -- generating a new random key. \
+                     This is only appropriate for development. In production, \
+                     provide an existing key file via 'consensus.validator_key' in config."
+                );
                 let mut seed = [0u8; 32];
                 rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
 
@@ -226,7 +258,7 @@ mod tests {
     #[test]
     fn test_worker_threads_default_from_toml() {
         // A TOML config without worker_threads should get the default.
-        let config = NodeConfig::from_toml("chain_id = 1\n").unwrap();
+        let config = NodeConfig::from_toml("chain_id = 1337\n").unwrap();
         assert!(config.worker_threads >= 1);
         assert!(config.worker_threads <= DEFAULT_WORKER_THREADS_CAP);
     }
@@ -313,5 +345,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.toml");
         assert!(NodeConfig::load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn test_chain_id_zero_rejected() {
+        let config = NodeConfig { chain_id: 0, ..Default::default() };
+        let err = config.validate();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("chain_id"));
+    }
+
+    #[test]
+    fn test_threshold_exceeds_participants_rejected() {
+        let config = NodeConfig {
+            consensus: crate::ConsensusConfig {
+                threshold: 5,
+                participants: vec![vec![0u8; 32], vec![1u8; 32]],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("exceeds participant count"));
+    }
+
+    #[test]
+    fn test_default_chain_id_is_1337() {
+        assert_eq!(DEFAULT_CHAIN_ID, 1337);
     }
 }

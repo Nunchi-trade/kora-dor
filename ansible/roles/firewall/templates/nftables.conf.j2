@@ -75,8 +75,9 @@ table inet filter {
     chain forward {
         type filter hook forward priority 0; policy drop;
 
-        # Allow Docker bridge traffic
+        # Allow Docker bridge traffic (default bridge and Compose custom bridges)
         iifname "docker0" oifname "docker0" accept
+        iifname "br-*" oifname "br-*" accept
         ct state established,related accept
     }
 

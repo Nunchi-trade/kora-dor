@@ -40,7 +40,7 @@ x-validator-common: &validator-common
   <<: *node-common
   restart: unless-stopped
   init: true
-  stop_grace_period: 5s
+  stop_grace_period: 30s
   stop_signal: SIGTERM
   read_only: true
   security_opt:
@@ -55,7 +55,7 @@ x-validator-common: &validator-common
   deploy:
     resources:
       limits:
-        memory: 4G
+        memory: 8G
         cpus: "2"
         pids: 4096
   tmpfs:
@@ -361,7 +361,7 @@ services:
       - "127.0.0.1:9004:9002"
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.4.1
     profiles: ["observability"]
     restart: unless-stopped
     read_only: true
@@ -430,7 +430,7 @@ services:
       - kora-net
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.6.0
     profiles: ["observability"]
     restart: unless-stopped
     read_only: true

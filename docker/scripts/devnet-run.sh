@@ -315,16 +315,18 @@ print_phase "2/3" "Starting validators and secondary peers"
 
 docker compose -f compose/devnet.yaml stop \
     validator-node0 validator-node1 validator-node2 validator-node3 secondary-node0 >/dev/null 2>&1 || true
-clear_runtime_state
+if [[ "${CLEAN_STATE:-false}" == "true" ]]; then
+    clear_runtime_state
+fi
 clear_startup_barrier
 
-if [[ "${COMPOSE_PROFILES:-}" == *observability* ]]; then
+if [[ "${NO_OBSERVABILITY:-}" == "true" ]]; then
+    run_with_spinner "Launching validator and secondary containers..." docker compose -f compose/devnet.yaml up -d \
+        validator-node0 validator-node1 validator-node2 validator-node3 secondary-node0
+else
     run_with_spinner "Launching validator, secondary, and observability containers..." docker compose -f compose/devnet.yaml --profile observability up -d \
         validator-node0 validator-node1 validator-node2 validator-node3 secondary-node0 \
         prometheus grafana loki promtail
-else
-    run_with_spinner "Launching validator and secondary containers..." docker compose -f compose/devnet.yaml up -d \
-        validator-node0 validator-node1 validator-node2 validator-node3 secondary-node0
 fi
 
 # Wait for validators with spinner

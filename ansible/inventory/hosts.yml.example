@@ -5,13 +5,16 @@
 #
 # Requirements:
 #   - Target must be Arch Linux (playbooks use pacman)
-#   - Root SSH access via key-based authentication
+#   - SSH key-based authentication
 #   - hosts.yml is gitignored to protect server IPs
+#
+# Security: use a dedicated deploy user with limited sudo instead of root.
+# See provision.yml for setting up the kora-deploy user.
 all:
   children:
     devnet:
       hosts:
         hetzner-devnet:
           ansible_host: YOUR_SERVER_IP
-          ansible_user: root
+          ansible_user: kora-deploy
           ansible_python_interpreter: /usr/bin/python3

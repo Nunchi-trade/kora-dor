@@ -25,7 +25,7 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-multiple-versions = "allow"
+multiple-versions = "warn"
 wildcards = "allow"
 skip = [
     "getrandom",

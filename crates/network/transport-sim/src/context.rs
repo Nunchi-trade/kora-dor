@@ -48,12 +48,27 @@ impl fmt::Debug for SimContext {
 
 impl SimContext {
     /// Create a new simulation context wrapping a tokio context.
+    ///
+    /// On Linux the entire `127.0.0.0/8` subnet is routable via the loopback
+    /// interface, so we randomize the base address for isolation between
+    /// parallel test processes.  On macOS only `127.0.0.1` is configured on
+    /// `lo0`, so binding to any other `127.x.x.x` address fails with
+    /// `BindFailed`.  We fall back to `127.0.0.1` there and rely solely on
+    /// the randomized port offset for isolation.
     pub fn new(inner: tokio::Context) -> Self {
         let mut rng = OsRng;
         let span = u32::from(PORT_BASE_MAX - PORT_BASE_MIN + 1);
         let base = PORT_BASE_MIN + (rng.next_u32() % span) as u16;
-        let seed = rng.next_u32() ^ std::process::id();
-        let base_addr = Ipv4Addr::new(127, (seed >> 16) as u8, (seed >> 8) as u8, seed as u8);
+
+        #[cfg(target_os = "macos")]
+        let base_addr = Ipv4Addr::LOCALHOST;
+
+        #[cfg(not(target_os = "macos"))]
+        let base_addr = {
+            let seed = rng.next_u32() ^ std::process::id();
+            Ipv4Addr::new(127, (seed >> 16) as u8, (seed >> 8) as u8, seed as u8)
+        };
+
         Self { inner, force_base_addr: true, base_addr, port_offset: base }
     }
 }

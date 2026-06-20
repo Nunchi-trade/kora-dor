@@ -37,8 +37,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Copy source and build application
 COPY . .
 
-# Build all binaries
-RUN cargo build --release -p kora -p keygen -p loadgen
+# Build production binaries (loadgen excluded from production image)
+RUN cargo build --release -p kora -p keygen
 
 # ───────────────────────────────────────────────────────────────────────────
 # Stage 4: Runtime - Minimal production image
@@ -59,10 +59,9 @@ RUN useradd -m -u 1000 -s /bin/bash kora && \
     mkdir -p /var/lib/kora /etc/kora /data /shared /runtime && \
     chown -R kora:kora /var/lib/kora /etc/kora /data /shared /runtime
 
-# Copy binaries from builder
+# Copy binaries from builder (loadgen excluded from production image)
 COPY --from=builder /app/target/release/kora /usr/local/bin/
 COPY --from=builder /app/target/release/keygen /usr/local/bin/
-COPY --from=builder /app/target/release/loadgen /usr/local/bin/
 
 # Copy entrypoint scripts
 COPY docker/scripts/ /scripts/

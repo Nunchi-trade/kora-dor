@@ -1,7 +1,17 @@
 ---
 # Wipe devnet clean: stop containers, remove volumes, optionally remove image
+#
+# This is a destructive operation. Pass -e confirm_reset=yes to proceed:
+#   ansible-playbook ansible/playbooks/reset.yml -e confirm_reset=yes
 - name: Reset devnet
   hosts: devnet
   become: true
+  pre_tasks:
+    - name: Require explicit confirmation for destructive reset
+      ansible.builtin.fail:
+        msg: >-
+          This playbook will destroy all devnet state (containers, volumes,
+          DKG shares, QMDB data). Pass -e confirm_reset=yes to confirm.
+      when: confirm_reset is not defined or confirm_reset != 'yes'
   roles:
     - reset

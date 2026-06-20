@@ -24,6 +24,9 @@ commonware-codec.workspace = true
 commonware-cryptography.workspace = true
 rand.workspace = true
 
+# Logging
+tracing.workspace = true
+
 # Misc
 alloy-primitives.workspace = true
 

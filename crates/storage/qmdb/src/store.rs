@@ -277,12 +277,19 @@ where
                 Err(e) => return Err(QmdbError::Storage(e.to_string())),
             };
 
-            // Increment generation on recreate or selfdestruct to invalidate old storage.
-            let new_gen = if update.created || update.selfdestructed {
-                current_gen.saturating_add(1)
-            } else {
-                current_gen
-            };
+            // Increment generation on recreate or selfdestruct to invalidate old
+            // storage.  Each lifecycle transition bumps independently so that a
+            // create-then-selfdestruct in the same changeset produces two bumps,
+            // preventing ghost storage slots from the intermediate deployment
+            // (issue #141, defense-in-depth alongside the merge() fix).
+            let mut gen_bumps: u64 = 0;
+            if update.created {
+                gen_bumps += 1;
+            }
+            if update.selfdestructed {
+                gen_bumps += 1;
+            }
+            let new_gen = current_gen.saturating_add(gen_bumps);
 
             if update.selfdestructed {
                 batches.accounts.push((*address, None));
@@ -593,5 +600,106 @@ mod tests {
             assert_eq!(seqs.code, Some(i));
             assert!(seqs.is_consistent());
         }
+    }
+
+    #[tokio::test]
+    async fn build_batches_bumps_generation_for_created() {
+        use crate::changes::AccountUpdate;
+
+        let mut store = create_test_store();
+        let addr = Address::repeat_byte(0x01);
+
+        // Seed the account at generation 0.
+        let seed = ChangeSet {
+            accounts: std::collections::BTreeMap::from([(
+                addr,
+                AccountUpdate {
+                    created: true,
+                    selfdestructed: false,
+                    nonce: 1,
+                    balance: U256::from(100),
+                    code_hash: B256::ZERO,
+                    code: None,
+                    storage: std::collections::BTreeMap::from([(U256::from(1), U256::from(42))]),
+                },
+            )]),
+        };
+        store.commit_changes(seed).await.unwrap();
+
+        // Now CREATE2 at the same address -> generation should bump by 1.
+        let changes = ChangeSet {
+            accounts: std::collections::BTreeMap::from([(
+                addr,
+                AccountUpdate {
+                    created: true,
+                    selfdestructed: false,
+                    nonce: 1,
+                    balance: U256::from(200),
+                    code_hash: B256::ZERO,
+                    code: None,
+                    storage: std::collections::BTreeMap::from([(U256::from(2), U256::from(99))]),
+                },
+            )]),
+        };
+        let batches = store.build_batches(&changes).await.unwrap();
+
+        // The account should be encoded with generation 2 (was 1 from seed, bumped to 2).
+        let (_, encoded) = &batches.accounts[0];
+        let encoded = encoded.as_ref().unwrap();
+        let (_, _, _, generation) = AccountEncoding::decode(encoded).unwrap();
+        assert_eq!(generation, 2, "generation should be bumped by 1 for created account");
+    }
+
+    #[tokio::test]
+    async fn build_batches_bumps_generation_twice_for_created_and_selfdestructed() {
+        // Even though the merge() fix should prevent both flags being true
+        // simultaneously, build_batches() should defensively handle it by
+        // bumping the generation by 2 (issue #141 defense-in-depth).
+        use crate::changes::AccountUpdate;
+
+        let mut store = create_test_store();
+        let addr = Address::repeat_byte(0x02);
+
+        // Seed the account at generation 0.
+        let seed = ChangeSet {
+            accounts: std::collections::BTreeMap::from([(
+                addr,
+                AccountUpdate {
+                    created: false,
+                    selfdestructed: false,
+                    nonce: 1,
+                    balance: U256::from(100),
+                    code_hash: B256::ZERO,
+                    code: None,
+                    storage: std::collections::BTreeMap::new(),
+                },
+            )]),
+        };
+        store.commit_changes(seed).await.unwrap();
+
+        // Manually construct an update with both flags true (should not happen
+        // after the merge() fix, but this tests the defense-in-depth).
+        let changes = ChangeSet {
+            accounts: std::collections::BTreeMap::from([(
+                addr,
+                AccountUpdate {
+                    created: true,
+                    selfdestructed: true,
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    storage: std::collections::BTreeMap::new(),
+                },
+            )]),
+        };
+        let batches = store.build_batches(&changes).await.unwrap();
+
+        // The account is selfdestructed, so it should be deleted (None).
+        let (_, encoded) = &batches.accounts[0];
+        assert!(encoded.is_none(), "selfdestructed account should be deleted");
+
+        // No storage entries should be present.
+        assert!(batches.storage.is_empty(), "no storage for selfdestructed account");
     }
 }

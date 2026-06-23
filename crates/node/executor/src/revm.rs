@@ -460,17 +460,20 @@ impl<S: StateDb> BlockExecutor<S> for RevmExecutor {
                 // `db.commit()` which consumes it.
                 let changes = extract_changes(&evm_state);
                 evm.ctx.modify_db(|db| db.commit(evm_state));
+
+                // Short-circuit: if the commit failed, abort the block
+                // immediately rather than executing more transactions against
+                // inconsistent state.  Previously this check only ran after the
+                // entire block, allowing subsequent transactions to produce
+                // incorrect receipts (issue #022).
+                if state.take_commit_failure() {
+                    return Err(ExecutionError::StateCommit);
+                }
+
                 outcome.changes.merge(changes);
             }
 
             outcome.gas_used = cumulative_gas;
-        }
-
-        // Check the side-channel flag for DatabaseCommit failures.
-        // REVM's DatabaseCommit::commit() is infallible, so QMDB write errors
-        // are recorded via an atomic flag on the state handle and checked here.
-        if state.take_commit_failure() {
-            return Err(ExecutionError::StateCommit);
         }
 
         // --- post-execution hook ---

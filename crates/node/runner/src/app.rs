@@ -303,6 +303,21 @@ where
         };
         let snapshot_elapsed = start.elapsed();
 
+        // Guard: do not build a proposal on top of a certificate-trusted
+        // snapshot whose overlay state may be stale.  The snapshot was
+        // created during catch-up with an empty changeset, so nonces and
+        // balances fall through to the QMDB base layer which may not yet
+        // reflect this block's state transitions.
+        if !parent_snapshot.verified {
+            warn!(
+                parent_height = parent.height,
+                ?parent_digest,
+                "build_block: parent snapshot is certificate-trusted (not locally verified), \
+                 skipping proposal to avoid stale state"
+            );
+            return None;
+        }
+
         let (_, mempool, snapshots) = self.ledger.proposal_components().await;
         let excluded = match self.collect_pending_tx_ids(&snapshots, parent_digest) {
             Some(ids) => ids,

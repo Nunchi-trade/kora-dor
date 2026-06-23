@@ -12,8 +12,10 @@ use crate::{
 
 /// Sentinel address used to store the commit sequence number in the accounts partition.
 ///
-/// Derived from the first 20 bytes of keccak256(b"__QMDB_COMMIT_SEQ__").
-/// This is a preimage-resistant address that will not collide with any real Ethereum account.
+/// This is a manually chosen constant address (`0xFFFF...FFFE`) that is
+/// extremely unlikely to collide with any real Ethereum account address.
+/// It is NOT derived from a hash function. A separate metadata namespace
+/// would be the ideal long-term solution.
 pub const COMMIT_SEQ_ACCOUNT_KEY: Address = Address::new([
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
     0xFF, 0xFF, 0xFF, 0xFE,
@@ -278,6 +280,13 @@ where
             };
 
             // Increment generation on recreate or selfdestruct to invalidate old storage.
+            //
+            // NOTE: Old storage entries under `(address, old_gen, slot)` are NOT
+            // deleted -- they become orphaned on disk. This is correct for reads
+            // (new gen keys never match old entries) but causes unbounded disk
+            // growth on repeated self-destruct/recreate cycles. A background GC
+            // task should eventually enumerate and delete entries with stale
+            // generations. See issue #030.
             let new_gen = if update.created || update.selfdestructed {
                 current_gen.saturating_add(1)
             } else {

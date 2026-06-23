@@ -370,11 +370,17 @@ impl LedgerView {
     }
 
     /// Restore a finalized block as an already-persisted snapshot over the current QMDB state.
+    ///
+    /// The resulting snapshot is marked as *unverified* because it was not
+    /// produced by full local execution -- the overlay has an empty changeset
+    /// that falls through to the QMDB base layer. Callers must not use it as
+    /// a parent for building new proposals until QMDB has committed this
+    /// block's state transitions.
     pub async fn restore_persisted_snapshot(&self, block: &Block) {
         let mut inner = self.inner.lock().await;
         let digest = block.commitment();
         let state = OverlayState::new(inner.qmdb.state(), QmdbChangeSet::default());
-        let snapshot = Snapshot::new(
+        let snapshot = Snapshot::new_unverified(
             Some(block.parent()),
             state,
             block.state_root,

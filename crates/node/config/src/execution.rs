@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 /// Default gas limit per block.
 pub const DEFAULT_GAS_LIMIT: u64 = 250_000_000;
 
+/// Default QMDB page cache size in number of pages (4096 pages * 16 KB = 64 MB per partition).
+pub const DEFAULT_QMDB_PAGE_CACHE_SIZE: usize = 4_096;
+
 /// Initial base fee per gas (1 gwei).
 ///
 /// EIP-1559 base-fee accounting requires a non-zero seed value; starting
@@ -34,16 +37,33 @@ pub struct ExecutionConfig {
         deserialize_with = "deserialize_optional_address"
     )]
     pub fee_recipient: Option<Address>,
+
+    /// Number of pages in the QMDB page cache (per partition).
+    ///
+    /// Each page is 16 KB. The default of 4096 pages gives 64 MB per partition
+    /// (192 MB total across accounts, storage, and code). Increase for
+    /// production workloads with large state; decrease for memory-constrained
+    /// devnet nodes.
+    #[serde(default = "default_qmdb_page_cache_size")]
+    pub qmdb_page_cache_size: usize,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
-        Self { gas_limit: DEFAULT_GAS_LIMIT, fee_recipient: None }
+        Self {
+            gas_limit: DEFAULT_GAS_LIMIT,
+            fee_recipient: None,
+            qmdb_page_cache_size: DEFAULT_QMDB_PAGE_CACHE_SIZE,
+        }
     }
 }
 
 const fn default_gas_limit() -> u64 {
     DEFAULT_GAS_LIMIT
+}
+
+const fn default_qmdb_page_cache_size() -> usize {
+    DEFAULT_QMDB_PAGE_CACHE_SIZE
 }
 
 fn serialize_optional_address<S>(addr: &Option<Address>, serializer: S) -> Result<S::Ok, S::Error>
@@ -79,11 +99,16 @@ mod tests {
         let config = ExecutionConfig::default();
         assert_eq!(config.gas_limit, DEFAULT_GAS_LIMIT);
         assert_eq!(config.fee_recipient, None);
+        assert_eq!(config.qmdb_page_cache_size, DEFAULT_QMDB_PAGE_CACHE_SIZE);
     }
 
     #[test]
     fn test_execution_config_serde_roundtrip() {
-        let config = ExecutionConfig { gas_limit: 300_000_000, fee_recipient: None };
+        let config = ExecutionConfig {
+            gas_limit: 300_000_000,
+            fee_recipient: None,
+            qmdb_page_cache_size: DEFAULT_QMDB_PAGE_CACHE_SIZE,
+        };
         let serialized = serde_json::to_string(&config).expect("serialize");
         let deserialized: ExecutionConfig = serde_json::from_str(&serialized).expect("deserialize");
         assert_eq!(config, deserialized);
@@ -91,7 +116,11 @@ mod tests {
 
     #[test]
     fn test_execution_config_toml_roundtrip() {
-        let config = ExecutionConfig { gas_limit: 150_000_000, fee_recipient: None };
+        let config = ExecutionConfig {
+            gas_limit: 150_000_000,
+            fee_recipient: None,
+            qmdb_page_cache_size: DEFAULT_QMDB_PAGE_CACHE_SIZE,
+        };
         let serialized = toml::to_string(&config).expect("serialize toml");
         let deserialized: ExecutionConfig = toml::from_str(&serialized).expect("deserialize toml");
         assert_eq!(config, deserialized);
@@ -102,6 +131,7 @@ mod tests {
         let config: ExecutionConfig = serde_json::from_str("{}").expect("deserialize");
         assert_eq!(config.gas_limit, DEFAULT_GAS_LIMIT);
         assert_eq!(config.fee_recipient, None);
+        assert_eq!(config.qmdb_page_cache_size, DEFAULT_QMDB_PAGE_CACHE_SIZE);
     }
 
     #[test]
@@ -110,6 +140,7 @@ mod tests {
             serde_json::from_str(r#"{"gas_limit": 10000000}"#).expect("deserialize");
         assert_eq!(config.gas_limit, 10_000_000);
         assert_eq!(config.fee_recipient, None);
+        assert_eq!(config.qmdb_page_cache_size, DEFAULT_QMDB_PAGE_CACHE_SIZE);
     }
 
     #[test]
@@ -119,7 +150,11 @@ mod tests {
 
     #[test]
     fn test_execution_config_clone_and_eq() {
-        let config = ExecutionConfig { gas_limit: 999, fee_recipient: None };
+        let config = ExecutionConfig {
+            gas_limit: 999,
+            fee_recipient: None,
+            qmdb_page_cache_size: DEFAULT_QMDB_PAGE_CACHE_SIZE,
+        };
         assert_eq!(config, config.clone());
         assert_ne!(config, ExecutionConfig::default());
     }
@@ -127,7 +162,7 @@ mod tests {
     #[test]
     fn test_fee_recipient_json_roundtrip() {
         let addr = "0xdead000000000000000000000000000000000001".parse::<Address>().unwrap();
-        let config = ExecutionConfig { gas_limit: DEFAULT_GAS_LIMIT, fee_recipient: Some(addr) };
+        let config = ExecutionConfig { fee_recipient: Some(addr), ..ExecutionConfig::default() };
         let serialized = serde_json::to_string(&config).expect("serialize");
         assert!(serialized.contains("0xdead"));
         let deserialized: ExecutionConfig = serde_json::from_str(&serialized).expect("deserialize");
@@ -137,7 +172,7 @@ mod tests {
     #[test]
     fn test_fee_recipient_toml_roundtrip() {
         let addr = "0xdead000000000000000000000000000000000001".parse::<Address>().unwrap();
-        let config = ExecutionConfig { gas_limit: DEFAULT_GAS_LIMIT, fee_recipient: Some(addr) };
+        let config = ExecutionConfig { fee_recipient: Some(addr), ..ExecutionConfig::default() };
         let serialized = toml::to_string(&config).expect("serialize toml");
         let deserialized: ExecutionConfig = toml::from_str(&serialized).expect("deserialize toml");
         assert_eq!(config, deserialized);

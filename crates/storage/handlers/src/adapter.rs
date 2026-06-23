@@ -91,13 +91,17 @@ where
     fn basic_ref(&self, address: Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
         let store = block_on(self.read());
         match block_on(store.get_account(&address))? {
-            Some((nonce, balance, code_hash, _gen)) => Ok(Some(revm::state::AccountInfo {
-                nonce,
-                balance,
-                code_hash,
-                code: None,
-                account_id: None,
-            })),
+            Some((nonce, balance, code_hash, generation)) => {
+                // Cache the generation for subsequent storage_ref calls.
+                self.cache_generation(address, generation);
+                Ok(Some(revm::state::AccountInfo {
+                    nonce,
+                    balance,
+                    code_hash,
+                    code: None,
+                    account_id: None,
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -114,14 +118,21 @@ where
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        let store = block_on(self.read());
-
-        // Get account to find generation
-        let generation = match block_on(store.get_account(&address))? {
-            Some((_, _, _, generation)) => generation,
-            None => return Ok(U256::ZERO),
+        // Try the generation cache first to avoid a redundant account read.
+        let generation = if let Some(cached) = self.cached_generation(&address) {
+            cached
+        } else {
+            let store = block_on(self.read());
+            match block_on(store.get_account(&address))? {
+                Some((_, _, _, generation)) => {
+                    self.cache_generation(address, generation);
+                    generation
+                }
+                None => return Ok(U256::ZERO),
+            }
         };
 
+        let store = block_on(self.read());
         let key = StorageKey::new(address, generation, index);
         Ok(block_on(store.get_storage(&key))?.unwrap_or(U256::ZERO))
     }
@@ -148,13 +159,17 @@ where
         async move {
             let store = handle.read().await;
             match store.get_account(&address).await? {
-                Some((nonce, balance, code_hash, _gen)) => Ok(Some(revm::state::AccountInfo {
-                    nonce,
-                    balance,
-                    code_hash,
-                    code: None,
-                    account_id: None,
-                })),
+                Some((nonce, balance, code_hash, generation)) => {
+                    // Cache the generation for subsequent storage reads.
+                    handle.cache_generation(address, generation);
+                    Ok(Some(revm::state::AccountInfo {
+                        nonce,
+                        balance,
+                        code_hash,
+                        code: None,
+                        account_id: None,
+                    }))
+                }
                 None => Ok(None),
             }
         }
@@ -184,11 +199,20 @@ where
     ) -> impl std::future::Future<Output = Result<U256, Self::Error>> + Send {
         let handle = self.clone();
         async move {
-            let store = handle.read().await;
-            let generation = match store.get_account(&address).await? {
-                Some((_, _, _, generation)) => generation,
-                None => return Ok(U256::ZERO),
+            // Try the generation cache first to avoid a redundant account read.
+            let generation = if let Some(cached) = handle.cached_generation(&address) {
+                cached
+            } else {
+                let store = handle.read().await;
+                match store.get_account(&address).await? {
+                    Some((_, _, _, generation)) => {
+                        handle.cache_generation(address, generation);
+                        generation
+                    }
+                    None => return Ok(U256::ZERO),
+                }
             };
+            let store = handle.read().await;
             let key = StorageKey::new(address, generation, index);
             Ok(store.get_storage(&key).await?.unwrap_or(U256::ZERO))
         }
@@ -243,6 +267,10 @@ where
                 },
             );
         }
+
+        // Invalidate cached generations for created/selfdestructed accounts
+        // before the commit, since their generation will change.
+        self.invalidate_generations(&changeset);
 
         // REVM's `DatabaseCommit::commit` returns `()`, so we cannot propagate
         // errors through the return type.  Instead we log at error level and

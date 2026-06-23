@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, U256};
 use commonware_runtime::{Supervisor as _, tokio::Context};
 use kora_backend::{
     AccountStore, CodeStore, CommonwareBackend, CommonwareRootProvider, QmdbBackendConfig,
@@ -8,7 +8,6 @@ use kora_backend::{
 };
 use kora_domain::StateRoot;
 use kora_handlers::{HandleError, QmdbHandle, QmdbRefDb as HandlerQmdbRefDb};
-use kora_qmdb::StateRoot as QmdbStateRoot;
 use kora_traits::{StateDb, StateDbWrite};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -86,7 +85,7 @@ impl QmdbLedger {
         let handle =
             Handle::from_store(store).with_root_provider(Arc::new(RwLock::new(root_provider)));
 
-        if apply_genesis {
+        if apply_genesis && starting_seq == 0 {
             handle.init_genesis(genesis_alloc).await?;
         }
         Ok(Self { handle })
@@ -109,20 +108,12 @@ impl QmdbLedger {
     }
 
     /// Commits the provided changes to QMDB and returns the resulting root.
+    ///
+    /// Delegates to [`StateDbWrite::commit`] on the underlying handle so there
+    /// is exactly one code path that acquires the storage-access mutex and the
+    /// store write lock.
     pub async fn commit_changes(&self, changes: QmdbChangeSet) -> Result<StateRoot, Error> {
-        let _storage_access = self.handle.storage_access().await;
-        let mut store = self.handle.write().await;
-        store
-            .commit_changes(changes)
-            .await
-            .map_err(|e| kora_traits::StateDbError::Storage(e.to_string()))?;
-        let stores =
-            store.stores().map_err(|e| kora_traits::StateDbError::Storage(e.to_string()))?;
-        let root = QmdbStateRoot::compute(
-            B256::from_slice(stores.accounts.root()?.as_ref()),
-            B256::from_slice(stores.storage.root()?.as_ref()),
-            B256::from_slice(stores.code.root()?.as_ref()),
-        );
+        let root = StateDbWrite::commit(&self.handle, changes).await?;
         Ok(StateRoot(root))
     }
 

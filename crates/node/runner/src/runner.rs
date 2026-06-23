@@ -985,6 +985,12 @@ impl NodeRunner for ProductionRunner {
         ArchiveInitializer::migrate_from_immutable(&context, &blocks_prefix).await;
 
         <ThresholdScheme as commonware_cryptography::certificate::Scheme>::certificate_codec_config_unbounded();
+        // NOTE: These archives are initialized as prunable but no code path
+        // currently invokes `prune()` on them. The marshal owns the archive
+        // handles and does not call prune internally. Journal files will grow
+        // without bound (~1 GB/day on a 33 blocks/s devnet with empty blocks).
+        // Upstream work is needed for the marshal to call prune() after
+        // finalization acknowledgments exceed a retention window. See issue #071.
         let finalizations_by_height =
             ArchiveInitializer::init_prunable_checkpointed::<_, ConsensusDigest, CertArchive>(
                 context.child("finalizations_by_height"),
@@ -1006,9 +1012,19 @@ impl NodeRunner for ProductionRunner {
             .context("init blocks archive")?;
 
         let has_finalized_history = finalized_blocks.last_index().is_some();
-        let state = LedgerView::init_with_genesis_options(
+        let qmdb_config = {
+            let mut cfg =
+                kora_qmdb_ledger::QmdbConfig::new(format!("{}-qmdb", self.partition_prefix));
+            if let Ok(nz) = std::num::NonZeroUsize::try_from(config.execution.qmdb_page_cache_size)
+            {
+                let page_size = cfg.page_size;
+                cfg = cfg.with_page_cache(page_size, nz);
+            }
+            cfg
+        };
+        let state = LedgerView::init_with_config_and_genesis_options(
             context.child("state"),
-            format!("{}-qmdb", self.partition_prefix),
+            qmdb_config,
             self.bootstrap.genesis_alloc.clone(),
             !has_finalized_history,
             self.bootstrap.genesis_timestamp,

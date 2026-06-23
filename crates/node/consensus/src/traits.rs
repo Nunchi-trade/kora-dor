@@ -28,10 +28,18 @@ pub struct Snapshot<S> {
     pub changes: ChangeSet,
     /// Transaction IDs included in this snapshot's block.
     pub tx_ids: BTreeSet<TxId>,
+    /// Whether this snapshot was produced by full local execution (`true`) or
+    /// reconstructed from a finality certificate during catch-up (`false`).
+    ///
+    /// An unverified snapshot should not be used as the parent for building new
+    /// proposals because its overlay state may be stale (the empty changeset
+    /// falls through to the QMDB base, which may not reflect this block's
+    /// state transitions yet).
+    pub verified: bool,
 }
 
 impl<S> Snapshot<S> {
-    /// Create a new snapshot.
+    /// Create a new fully-verified snapshot.
     pub const fn new(
         parent: Option<Digest>,
         state: S,
@@ -39,7 +47,18 @@ impl<S> Snapshot<S> {
         changes: ChangeSet,
         tx_ids: BTreeSet<TxId>,
     ) -> Self {
-        Self { parent, state, state_root, changes, tx_ids }
+        Self { parent, state, state_root, changes, tx_ids, verified: true }
+    }
+
+    /// Create a certificate-trusted snapshot that has NOT been locally executed.
+    pub const fn new_unverified(
+        parent: Option<Digest>,
+        state: S,
+        state_root: StateRoot,
+        changes: ChangeSet,
+        tx_ids: BTreeSet<TxId>,
+    ) -> Self {
+        Self { parent, state, state_root, changes, tx_ids, verified: false }
     }
 }
 

@@ -45,6 +45,14 @@ where
     C: Supervisor,
 {
     fn clone(&self) -> Self {
+        // Use `child()` with a stable label instead of creating a new child
+        // on every clone. The Commonware `Context` type does not implement
+        // `Clone`, so `child()` is the only way to obtain a second handle.
+        // Using a fixed label prevents the label chain from growing on
+        // successive clones (see issue #108). The `Supervisor::child` API
+        // always appends, so repeated clones of a clone will still grow by
+        // one segment per generation, but this is bounded by the clone
+        // depth rather than the total clone count.
         Self {
             inner: self.inner.child("nosync_storage"),
             partitions: self.partitions.clone(),

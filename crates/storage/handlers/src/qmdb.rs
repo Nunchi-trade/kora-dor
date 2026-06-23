@@ -1,8 +1,11 @@
 //! Thread-safe QMDB handle.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use alloy_primitives::{Address, B256, U256};
@@ -45,6 +48,10 @@ pub struct QmdbHandle<A, S, C> {
     /// Instead, this flag is set so callers can check after execution and
     /// surface the failure.
     commit_failed: Arc<AtomicBool>,
+    /// Cache of `Address -> generation` to avoid a redundant account lookup on
+    /// every `SLOAD`. The generation number only changes on `CREATE` or
+    /// `SELFDESTRUCT`, so this cache has a near-100% hit rate.
+    generation_cache: Arc<std::sync::RwLock<HashMap<Address, u64>>>,
 }
 
 impl<A, S, C> Clone for QmdbHandle<A, S, C> {
@@ -54,6 +61,7 @@ impl<A, S, C> Clone for QmdbHandle<A, S, C> {
             root_provider: self.root_provider.clone(),
             storage_access: Arc::clone(&self.storage_access),
             commit_failed: Arc::clone(&self.commit_failed),
+            generation_cache: Arc::clone(&self.generation_cache),
         }
     }
 }
@@ -67,6 +75,7 @@ impl<A, S, C> QmdbHandle<A, S, C> {
             root_provider: None,
             storage_access: Arc::new(Mutex::new(())),
             commit_failed: Arc::new(AtomicBool::new(false)),
+            generation_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -78,6 +87,7 @@ impl<A, S, C> QmdbHandle<A, S, C> {
             root_provider: None,
             storage_access: Arc::new(Mutex::new(())),
             commit_failed: Arc::new(AtomicBool::new(false)),
+            generation_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -125,6 +135,30 @@ impl<A, S, C> QmdbHandle<A, S, C> {
     /// Acquire write lock on the underlying store.
     pub async fn write(&self) -> RwLockWriteGuard<'_, QmdbStore<A, S, C>> {
         self.inner.write().await
+    }
+
+    /// Look up a cached generation for `address`.
+    pub fn cached_generation(&self, address: &Address) -> Option<u64> {
+        self.generation_cache.read().ok()?.get(address).copied()
+    }
+
+    /// Insert an `Address -> generation` mapping into the cache.
+    pub fn cache_generation(&self, address: Address, generation: u64) {
+        if let Ok(mut cache) = self.generation_cache.write() {
+            cache.insert(address, generation);
+        }
+    }
+
+    /// Invalidate generation cache entries for addresses that were created or
+    /// self-destructed (i.e. whose generation changed).
+    pub fn invalidate_generations(&self, changes: &ChangeSet) {
+        if let Ok(mut cache) = self.generation_cache.write() {
+            for (address, update) in &changes.accounts {
+                if update.created || update.selfdestructed {
+                    cache.remove(address);
+                }
+            }
+        }
     }
 }
 

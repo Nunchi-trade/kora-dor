@@ -864,6 +864,15 @@ where
             // When we find the already-verified parent, capture its
             // timestamp so we can validate timestamp monotonicity for
             // the oldest unverified block.
+            //
+            // The collection is bounded to `MAX_ANCESTRY_WALK` to prevent
+            // unbounded memory usage when a long chain of unverified blocks
+            // is encountered (e.g. after a prolonged disconnect).  If the
+            // limit is reached without finding a verified ancestor, the
+            // verification fails -- the node should rely on catch-up /
+            // state-sync to recover rather than buffering the entire chain.
+            const MAX_ANCESTRY_WALK: usize = 1024;
+
             let mut blocks_to_verify = Vec::new();
             let mut verified_parent_timestamp: Option<u64> = None;
             while let Some(block) = ancestry.next().await {
@@ -874,6 +883,14 @@ where
                     break;
                 }
                 blocks_to_verify.push(block);
+                if blocks_to_verify.len() >= MAX_ANCESTRY_WALK {
+                    warn!(
+                        collected = blocks_to_verify.len(),
+                        "verify: ancestry walk exceeded MAX_ANCESTRY_WALK \
+                         without finding a verified ancestor -- aborting"
+                    );
+                    return false;
+                }
             }
             let ancestry_elapsed = start.elapsed();
 

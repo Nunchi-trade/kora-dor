@@ -394,11 +394,26 @@ impl LedgerView {
     /// internal [`Notify`](::tokio::sync::Notify) that fires whenever a new
     /// snapshot is inserted. Falls back to the timeout if the snapshot never
     /// arrives.
+    ///
+    /// To avoid holding the async `Mutex` during each poll iteration (which
+    /// causes contention when many waiters are notified simultaneously), we
+    /// clone the `InMemorySnapshotStore` handle once under the mutex and use
+    /// it directly for subsequent checks.  Because the store's internal
+    /// state is behind `Arc<RwLock<..>>`, the cloned handle sees insertions
+    /// made by other tasks without requiring the outer mutex.
     pub async fn wait_for_snapshot(
         &self,
         parent: ConsensusDigest,
         timeout: Duration,
     ) -> Option<LedgerSnapshot> {
+        // Clone the snapshot store handle once under the mutex so that
+        // subsequent poll iterations can check the store without
+        // re-acquiring the heavier async Mutex on each iteration.
+        let snapshots = {
+            let inner = self.inner.lock().await;
+            inner.snapshots.clone()
+        };
+
         let deadline = ::tokio::time::Instant::now() + timeout;
         loop {
             // Register the notification future BEFORE checking the snapshot.
@@ -406,7 +421,7 @@ impl LedgerView {
             // between the check and the wait, which would cause a lost
             // wake-up and an unnecessary full-timeout delay.
             let notified = self.snapshot_notify.notified();
-            if let Some(snap) = self.parent_snapshot(parent).await {
+            if let Some(snap) = snapshots.get(&parent) {
                 return Some(snap);
             }
             let remaining = deadline.saturating_duration_since(::tokio::time::Instant::now());

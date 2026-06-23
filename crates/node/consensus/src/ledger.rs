@@ -84,26 +84,32 @@ where
     /// (starting from `parent`) to exclude already-included transactions,
     /// then returns up to `max_txs` transactions from the mempool.
     ///
+    /// Returns `None` if the snapshot chain has a gap and the excluded set
+    /// cannot be computed reliably (see [`Self::collect_ancestor_tx_ids`]).
+    ///
     /// # Arguments
     ///
     /// * `parent` - The parent block digest (or `None` for genesis).
     /// * `max_txs` - Maximum number of transactions to return.
+    ///
     /// # Returns
     ///
-    /// A vector of transactions suitable for inclusion in a new block.
-    pub fn build_proposal_txs(&self, parent: Option<Digest>, max_txs: usize) -> Vec<Tx> {
-        let excluded = self.collect_ancestor_tx_ids(parent);
-        self.mempool.build(max_txs, &excluded)
+    /// `Some(txs)` on success, or `None` if the ancestor snapshot chain is
+    /// incomplete and building a proposal would risk duplicate transactions.
+    pub fn build_proposal_txs(&self, parent: Option<Digest>, max_txs: usize) -> Option<Vec<Tx>> {
+        let excluded = self.collect_ancestor_tx_ids(parent)?;
+        Some(self.mempool.build(max_txs, &excluded))
     }
 
     /// Collect transaction IDs from unpersisted ancestor blocks.
     ///
-    /// Currently returns an empty set since `Snapshot<S>` does not contain
-    /// transaction data. Transaction deduplication relies on the mempool's
-    /// prune mechanism after finalization.
-    fn collect_ancestor_tx_ids(&self, _parent: Option<Digest>) -> BTreeSet<TxId> {
+    /// Returns `None` if the snapshot chain has a gap (a snapshot was
+    /// evicted before we could read it).  In that case the caller **must
+    /// not** build a block, because we cannot guarantee the excluded set is
+    /// complete and would risk including duplicate transactions.
+    fn collect_ancestor_tx_ids(&self, parent: Option<Digest>) -> Option<BTreeSet<TxId>> {
         let mut excluded = BTreeSet::new();
-        let mut current = _parent;
+        let mut current = parent;
 
         while let Some(digest) = current {
             if self.snapshots.is_persisted(&digest) {
@@ -111,13 +117,19 @@ where
             }
 
             let Some(snapshot) = self.snapshots.get(&digest) else {
-                break;
+                tracing::warn!(
+                    ?digest,
+                    collected_so_far = excluded.len(),
+                    "snapshot chain gap during tx exclusion collection -- \
+                     refusing to build proposal to prevent duplicate transactions"
+                );
+                return None;
             };
             excluded.extend(snapshot.tx_ids.iter().copied());
             current = snapshot.parent;
         }
 
-        excluded
+        Some(excluded)
     }
 
     /// Get the snapshot for a parent digest.
@@ -348,7 +360,7 @@ mod tests {
         ledger.mempool().insert(Tx::new(vec![4, 5, 6].into()));
 
         // Build proposal without parent
-        let txs = ledger.build_proposal_txs(None, 10);
+        let txs = ledger.build_proposal_txs(None, 10).expect("no snapshot gap");
         assert_eq!(txs.len(), 2);
     }
 

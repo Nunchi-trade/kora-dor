@@ -92,9 +92,11 @@ impl<S> InMemorySnapshotStore<S> {
     /// This is the count of entries in the snapshot map whose digest is not
     /// in the persisted set.  A rising value under steady-state operation
     /// indicates the persistence pipeline is falling behind block production.
+    ///
+    /// Lock ordering: `persisted(R)` -> `snapshots(R)`.
     pub fn unpersisted_count(&self) -> usize {
-        let snapshots = self.snapshots.read();
         let persisted = self.persisted.read();
+        let snapshots = self.snapshots.read();
         snapshots.keys().filter(|d| !persisted.contains(d)).count()
     }
 }
@@ -135,6 +137,15 @@ impl<S> InMemorySnapshotStore<S> {
     /// boundaries.
     ///
     /// Returns the number of snapshots evicted.
+    ///
+    /// # Lock ordering
+    ///
+    /// All methods that acquire multiple locks follow the canonical order:
+    /// `persisted` -> `persisted_order` -> `snapshots`.  This method
+    /// acquires `persisted(R)` then `persisted_order(W)` then
+    /// `snapshots(W)`, which is consistent with this ordering and prevents
+    /// deadlocks with concurrent calls to `mark_persisted`,
+    /// `unpersisted_count`, `merged_changes`, and `changes_for_persist`.
     pub fn evict_persisted(&self) -> usize {
         // Fast path: check with a read lock to avoid write-lock contention
         // when no eviction is needed (the common case).
@@ -142,9 +153,10 @@ impl<S> InMemorySnapshotStore<S> {
             return 0;
         }
 
-        let mut snapshots = self.snapshots.write();
+        // Acquire locks in canonical order: persisted -> persisted_order -> snapshots.
         let persisted = self.persisted.read();
         let mut order = self.persisted_order.write();
+        let mut snapshots = self.snapshots.write();
 
         let mut evicted = 0usize;
         while order.len() > self.max_persisted_retained {
@@ -200,13 +212,14 @@ impl<S: StateDb> SnapshotStore<S> for InMemorySnapshotStore<S> {
         }
     }
 
+    /// Lock ordering: `persisted(R)` -> `snapshots(R)`.
     fn merged_changes(
         &self,
         parent: Digest,
         new_changes: ChangeSet,
     ) -> Result<ChangeSet, ConsensusError> {
-        let snapshots = self.snapshots.read();
         let persisted = self.persisted.read();
+        let snapshots = self.snapshots.read();
 
         // Walk back to find all unpersisted ancestors
         let mut chain = Vec::new();
@@ -234,12 +247,13 @@ impl<S: StateDb> SnapshotStore<S> for InMemorySnapshotStore<S> {
         Ok(merged)
     }
 
+    /// Lock ordering: `persisted(R)` -> `snapshots(R)`.
     fn changes_for_persist(
         &self,
         digest: Digest,
     ) -> Result<(Vec<Digest>, ChangeSet), ConsensusError> {
-        let snapshots = self.snapshots.read();
         let persisted = self.persisted.read();
+        let snapshots = self.snapshots.read();
 
         let mut chain = Vec::new();
         let mut changes_chain = Vec::new();

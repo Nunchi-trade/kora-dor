@@ -434,6 +434,11 @@ impl<S: StateProvider + 'static> EthApiImpl<S> {
         }
 
         let estimate = estimate_recent_fees(&*provider, head, self.gas_oracle_config).await;
+        // Release the state_provider read lock before acquiring the
+        // gas_oracle_cache write lock.  This eliminates the nested lock
+        // ordering dependency (state_provider -> gas_oracle_cache) and
+        // reduces the duration the state_provider lock is held.
+        drop(provider);
         *self.gas_oracle_cache.write().await = Some(CachedGasOracleEstimate { head, estimate });
         Ok(estimate)
     }
@@ -600,7 +605,13 @@ impl<S: StateProvider + 'static> EthApiServer for EthApiImpl<S> {
         let provider = self.state_provider.read().await;
         let indexed = provider.transaction_by_hash(hash).await?;
         if indexed.is_some() {
-            self.pending_txs.write().await.remove(&hash);
+            // Only acquire the write lock when the hash is actually in the
+            // pending pool.  The common case (confirmed tx that was never
+            // pending locally) now takes a cheap read lock instead of
+            // serializing with send_raw_transaction writers.
+            if self.pending_txs.read().await.contains_key(&hash) {
+                self.pending_txs.write().await.remove(&hash);
+            }
             return Ok(indexed);
         }
         Ok(self.pending_txs.read().await.get(&hash).cloned())
@@ -633,11 +644,16 @@ impl<S: StateProvider + 'static> EthApiServer for EthApiImpl<S> {
             validate_reward_percentiles(percentiles)?;
         }
 
-        let provider = self.state_provider.read().await;
-        let head = provider
-            .block_number()
-            .await
-            .unwrap_or_else(|_| self.block_height.load(std::sync::atomic::Ordering::Relaxed));
+        // Acquire the lock briefly to resolve the head block number, then
+        // release it so that writers are not starved during the loop below
+        // which may iterate over up to 1,024 blocks.
+        let head = {
+            let provider = self.state_provider.read().await;
+            provider
+                .block_number()
+                .await
+                .unwrap_or_else(|_| self.block_height.load(std::sync::atomic::Ordering::Relaxed))
+        };
         let newest = resolve_fee_history_newest(newest_block, head);
         let requested = block_count.to::<u64>().min(1024);
         let count = requested.min(newest.saturating_add(1)) as usize;
@@ -651,6 +667,11 @@ impl<S: StateProvider + 'static> EthApiServer for EthApiImpl<S> {
         let mut last_gas_limit = 0;
 
         for block_number in oldest..oldest + count as u64 {
+            // Re-acquire the read lock per iteration so that writers (e.g.
+            // state provider swaps) can proceed between blocks.  Fee history
+            // is advisory data for gas estimation, so a slightly inconsistent
+            // cross-block view is acceptable.
+            let provider = self.state_provider.read().await;
             let block = block_by_number_or_none(&*provider, block_number, reward.is_some()).await;
             let base_fee = block
                 .as_ref()
@@ -678,6 +699,7 @@ impl<S: StateProvider + 'static> EthApiServer for EthApiImpl<S> {
                     rows.push(vec![U256::ZERO; percentiles.len()]);
                 }
             }
+            // provider read lock is released here at end of each iteration
         }
 
         let next_base_fee = last_base_fee

@@ -1,6 +1,6 @@
 //! Commonware-based QMDB backend implementation.
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
 use async_trait::async_trait;
 use commonware_codec::RangeCfg;
 use commonware_cryptography::sha256::Digest as QmdbDigest;
@@ -124,39 +124,69 @@ impl CommonwareBackend {
         state_root_from_stores(&self.accounts, &self.storage, &self.code)
     }
 
-    /// Check cross-partition commit sequence consistency.
+    /// Check cross-partition commit sequence consistency and repair if needed.
     ///
     /// Reads the commit sequence marker from each QMDB partition and verifies
     /// they all agree. If no markers exist (backward-compatible with pre-fix
-    /// databases), the check passes. If markers are present but differ, a
-    /// partial commit occurred during a previous crash and the node must not
-    /// start.
+    /// databases), the check passes.
+    ///
+    /// If markers are present but differ (indicating a partial commit from a
+    /// previous crash), this method attempts automatic recovery by writing the
+    /// sentinel marker to any partition that is behind, bringing all partitions
+    /// up to the maximum observed sequence. This avoids permanently bricking
+    /// the node after a crash during the commit window.
     ///
     /// Returns the [`PartitionCommitSeqs`] on success so the caller can
     /// initialize the `QmdbStore` with the correct starting sequence.
     ///
     /// # Errors
     ///
-    /// Returns [`BackendError::InconsistentPartitions`] if the sequences differ,
-    /// or a storage error if reading the markers fails.
-    pub async fn verify_partition_consistency(&self) -> Result<PartitionCommitSeqs, BackendError> {
+    /// Returns [`BackendError::InconsistentPartitions`] if repair fails,
+    /// or a storage error if reading/writing the markers fails.
+    pub async fn verify_partition_consistency(
+        &mut self,
+    ) -> Result<PartitionCommitSeqs, BackendError> {
         let seqs = read_partition_commit_seqs(&self.accounts, &self.storage, &self.code).await?;
 
-        if let Some(msg) = seqs.inconsistency_message() {
+        if seqs.is_consistent() {
+            info!(
+                commit_seq = ?seqs.accounts.unwrap_or(0),
+                "QMDB partition consistency check passed"
+            );
+            return Ok(seqs);
+        }
+
+        // Partitions are inconsistent -- attempt recovery by advancing behind
+        // partitions to the max observed sequence.
+        let target = seqs.max_seq().expect("inconsistent implies at least one Some");
+
+        tracing::warn!(
+            accounts_seq = ?seqs.accounts,
+            storage_seq = ?seqs.storage,
+            code_seq = ?seqs.code,
+            target_seq = target,
+            "QMDB partition inconsistency detected, repairing"
+        );
+
+        repair_partition_seqs(&mut self.accounts, &mut self.storage, &mut self.code, &seqs, target)
+            .await?;
+
+        // Re-read to confirm repair succeeded.
+        let repaired =
+            read_partition_commit_seqs(&self.accounts, &self.storage, &self.code).await?;
+
+        if let Some(msg) = repaired.inconsistency_message() {
             error!(
-                accounts_seq = ?seqs.accounts,
-                storage_seq = ?seqs.storage,
-                code_seq = ?seqs.code,
-                "QMDB partition consistency check FAILED"
+                accounts_seq = ?repaired.accounts,
+                storage_seq = ?repaired.storage,
+                code_seq = ?repaired.code,
+                "QMDB partition repair FAILED -- partitions still inconsistent"
             );
             return Err(BackendError::InconsistentPartitions(msg));
         }
 
-        info!(
-            commit_seq = ?seqs.accounts.unwrap_or(0),
-            "QMDB partition consistency check passed"
-        );
-        Ok(seqs)
+        info!(commit_seq = target, "QMDB partition inconsistency repaired successfully");
+        Ok(repaired)
     }
 }
 
@@ -323,6 +353,46 @@ async fn read_partition_commit_seqs(
     };
 
     Ok(PartitionCommitSeqs { accounts: accounts_seq, storage: storage_seq, code: code_seq })
+}
+
+/// Repair inconsistent partition commit sequences by writing the sentinel
+/// marker to any partition whose sequence is behind `target`.
+///
+/// This is the recovery counterpart to [`read_partition_commit_seqs`]. Each
+/// write is idempotent -- writing the same sentinel value twice is safe.
+async fn repair_partition_seqs(
+    accounts: &mut AccountStore,
+    storage: &mut StorageStore,
+    code: &mut CodeStore,
+    seqs: &PartitionCommitSeqs,
+    target: u64,
+) -> Result<(), BackendError> {
+    use kora_qmdb::{
+        COMMIT_SEQ_ACCOUNT_KEY, COMMIT_SEQ_CODE_KEY, COMMIT_SEQ_STORAGE_KEY, QmdbBatchable,
+        encode_commit_seq_account, encode_commit_seq_code,
+    };
+
+    if seqs.accounts != Some(target) {
+        accounts
+            .write_batch(vec![(COMMIT_SEQ_ACCOUNT_KEY, Some(encode_commit_seq_account(target)))])
+            .await
+            .map_err(|e| BackendError::Storage(e.to_string()))?;
+    }
+
+    if seqs.storage != Some(target) {
+        storage
+            .write_batch(vec![(COMMIT_SEQ_STORAGE_KEY, Some(U256::from(target)))])
+            .await
+            .map_err(|e| BackendError::Storage(e.to_string()))?;
+    }
+
+    if seqs.code != Some(target) {
+        code.write_batch(vec![(COMMIT_SEQ_CODE_KEY, Some(encode_commit_seq_code(target)))])
+            .await
+            .map_err(|e| BackendError::Storage(e.to_string()))?;
+    }
+
+    Ok(())
 }
 
 fn state_root_from_stores(

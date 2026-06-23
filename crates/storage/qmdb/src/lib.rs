@@ -23,7 +23,7 @@ pub use root::StateRoot;
 mod store;
 pub use store::{
     COMMIT_SEQ_ACCOUNT_KEY, COMMIT_SEQ_CODE_KEY, COMMIT_SEQ_STORAGE_KEY, PartitionCommitSeqs,
-    QmdbStore, Stores,
+    QmdbStore, Stores, encode_commit_seq_account, encode_commit_seq_code,
 };
 
 mod traits;

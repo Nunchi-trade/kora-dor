@@ -37,7 +37,7 @@ pub const COMMIT_SEQ_CODE_KEY: B256 = B256::new([
 /// Encode a commit sequence number into an 80-byte account value.
 ///
 /// The sequence is stored in the first 8 bytes (nonce field) with the rest zeroed.
-fn encode_commit_seq_account(seq: u64) -> [u8; AccountEncoding::SIZE] {
+pub fn encode_commit_seq_account(seq: u64) -> [u8; AccountEncoding::SIZE] {
     AccountEncoding::encode(seq, U256::ZERO, B256::ZERO, 0)
 }
 
@@ -47,7 +47,7 @@ fn decode_commit_seq_account(bytes: &[u8; AccountEncoding::SIZE]) -> Option<u64>
 }
 
 /// Encode a commit sequence number into a code partition value.
-fn encode_commit_seq_code(seq: u64) -> Vec<u8> {
+pub fn encode_commit_seq_code(seq: u64) -> Vec<u8> {
     seq.to_be_bytes().to_vec()
 }
 
@@ -107,6 +107,16 @@ impl PartitionCommitSeqs {
             self.storage.map_or("none".to_string(), |s| s.to_string()),
             self.code.map_or("none".to_string(), |s| s.to_string()),
         ))
+    }
+
+    /// Return the maximum commit sequence across all partitions.
+    ///
+    /// Returns `None` if no partition has a sequence marker. When partitions
+    /// are inconsistent after a partial commit, this identifies the target
+    /// sequence that behind partitions should be advanced to.
+    #[must_use]
+    pub fn max_seq(&self) -> Option<u64> {
+        [self.accounts, self.storage, self.code].into_iter().flatten().max()
     }
 }
 
@@ -378,6 +388,62 @@ where
         self.apply_batches(batches).await
     }
 
+    /// Repair inconsistent partition commit sequences after a partial commit.
+    ///
+    /// When a crash occurs between sequential partition writes in
+    /// [`apply_batches()`](Self::apply_batches), some partitions may have a
+    /// newer commit sequence than others. This method brings all partitions
+    /// up to the maximum observed sequence by writing the sentinel marker to
+    /// any partition that is behind.
+    ///
+    /// After a successful repair, the in-memory `commit_seq` is set to the
+    /// repaired value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if stores are unavailable or any write fails.
+    pub async fn repair_partition_seqs(
+        &mut self,
+        seqs: &PartitionCommitSeqs,
+    ) -> Result<(), QmdbError> {
+        let target = match seqs.max_seq() {
+            Some(t) => t,
+            None => return Ok(()), // No markers at all, nothing to repair.
+        };
+
+        let stores = self.stores_mut()?;
+
+        if seqs.accounts != Some(target) {
+            stores
+                .accounts
+                .write_batch(vec![(
+                    COMMIT_SEQ_ACCOUNT_KEY,
+                    Some(encode_commit_seq_account(target)),
+                )])
+                .await
+                .map_err(|e| QmdbError::Storage(e.to_string()))?;
+        }
+
+        if seqs.storage != Some(target) {
+            stores
+                .storage
+                .write_batch(vec![(COMMIT_SEQ_STORAGE_KEY, Some(U256::from(target)))])
+                .await
+                .map_err(|e| QmdbError::Storage(e.to_string()))?;
+        }
+
+        if seqs.code != Some(target) {
+            stores
+                .code
+                .write_batch(vec![(COMMIT_SEQ_CODE_KEY, Some(encode_commit_seq_code(target)))])
+                .await
+                .map_err(|e| QmdbError::Storage(e.to_string()))?;
+        }
+
+        self.commit_seq = target;
+        Ok(())
+    }
+
     /// Read the commit sequence marker from each partition.
     ///
     /// Returns [`PartitionCommitSeqs`] containing the sequence number found in
@@ -593,5 +659,103 @@ mod tests {
             assert_eq!(seqs.code, Some(i));
             assert!(seqs.is_consistent());
         }
+    }
+
+    #[test]
+    fn max_seq_returns_none_when_all_none() {
+        let seqs = PartitionCommitSeqs { accounts: None, storage: None, code: None };
+        assert_eq!(seqs.max_seq(), None);
+    }
+
+    #[test]
+    fn max_seq_returns_highest_value() {
+        let seqs = PartitionCommitSeqs { accounts: Some(5), storage: Some(4), code: Some(5) };
+        assert_eq!(seqs.max_seq(), Some(5));
+    }
+
+    #[test]
+    fn max_seq_handles_partial_presence() {
+        let seqs = PartitionCommitSeqs { accounts: Some(3), storage: None, code: None };
+        assert_eq!(seqs.max_seq(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn repair_partition_seqs_fixes_inconsistency() {
+        let mut store = create_test_store();
+
+        // Simulate a partial commit: write seq 1 only to the accounts partition.
+        let stores = store.stores_mut().unwrap();
+        stores
+            .accounts
+            .write_batch(vec![(COMMIT_SEQ_ACCOUNT_KEY, Some(encode_commit_seq_account(1)))])
+            .await
+            .unwrap();
+
+        // Verify inconsistency is detected.
+        let seqs = store.read_partition_commit_seqs().await.unwrap();
+        assert!(!seqs.is_consistent());
+        assert_eq!(seqs.accounts, Some(1));
+        assert_eq!(seqs.storage, None);
+        assert_eq!(seqs.code, None);
+
+        // Repair should bring all partitions to seq 1.
+        store.repair_partition_seqs(&seqs).await.unwrap();
+
+        let repaired = store.read_partition_commit_seqs().await.unwrap();
+        assert!(repaired.is_consistent());
+        assert_eq!(repaired.accounts, Some(1));
+        assert_eq!(repaired.storage, Some(1));
+        assert_eq!(repaired.code, Some(1));
+        assert_eq!(store.commit_seq(), 1);
+    }
+
+    #[tokio::test]
+    async fn repair_partition_seqs_handles_two_ahead_one_behind() {
+        let mut store = create_test_store();
+
+        // Write seq 5 to accounts and storage, but not code (simulating a crash
+        // after accounts + storage writes but before code write).
+        let stores = store.stores_mut().unwrap();
+        stores
+            .accounts
+            .write_batch(vec![(COMMIT_SEQ_ACCOUNT_KEY, Some(encode_commit_seq_account(5)))])
+            .await
+            .unwrap();
+        stores
+            .storage
+            .write_batch(vec![(COMMIT_SEQ_STORAGE_KEY, Some(U256::from(5)))])
+            .await
+            .unwrap();
+
+        let seqs = store.read_partition_commit_seqs().await.unwrap();
+        assert!(!seqs.is_consistent());
+
+        store.repair_partition_seqs(&seqs).await.unwrap();
+
+        let repaired = store.read_partition_commit_seqs().await.unwrap();
+        assert!(repaired.is_consistent());
+        assert_eq!(repaired.accounts, Some(5));
+        assert_eq!(repaired.storage, Some(5));
+        assert_eq!(repaired.code, Some(5));
+        assert_eq!(store.commit_seq(), 5);
+    }
+
+    #[tokio::test]
+    async fn repair_partition_seqs_noop_when_consistent() {
+        let mut store = create_test_store();
+
+        // Write a normal batch so all partitions are consistent.
+        let batches = StoreBatches::new();
+        store.apply_batches(batches).await.unwrap();
+
+        let seqs = store.read_partition_commit_seqs().await.unwrap();
+        assert!(seqs.is_consistent());
+
+        // Repair should be a no-op.
+        store.repair_partition_seqs(&seqs).await.unwrap();
+
+        let after = store.read_partition_commit_seqs().await.unwrap();
+        assert!(after.is_consistent());
+        assert_eq!(after.accounts, Some(1));
     }
 }
